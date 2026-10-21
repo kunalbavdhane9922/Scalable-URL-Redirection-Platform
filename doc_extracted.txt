@@ -1,0 +1,197 @@
+Normal: URL SHORTENER
+Normal: System Design & Implementation Blueprint
+Normal: A low-latency, horizontally scalable URL-shortening service
+Normal: Prepared from the architecture and design decisions discussed in this conversation.
+Heading 1: 1. Executive Summary
+Normal: The system accepts a long URL, creates a unique short code, persists the mapping, and returns a short URL. When someone opens that short URL, the service resolves the code and responds with an HTTP redirect (302 by default for editable links). The design prioritizes a very small redirect critical path, cache-first retrieval, horizontal application scaling, durable URL storage, and observable performance.
+Normal: The intended deployment supports a planning scenario of roughly 100,000 users and a peak test target of 10,000 redirect requests per second. These are requirements to validate, not measured results. Actual capacity depends on traffic distribution, cache hit rate, URL creation rate, response policy, infrastructure, and the load-test setup.
+Heading 1: 2. Goals, Scope, and Non-Goals
+Heading 2: 2.1 Goals
+List Bullet: Create short URLs from valid submitted URLs and return the generated short URL.
+List Bullet: Redirect visitors from a short URL to its original destination.
+List Bullet: Keep common redirects fast through a bounded local LRU cache and a shared Redis cache.
+List Bullet: Persist mappings in PostgreSQL and use an index on short_code for cache-miss lookups.
+List Bullet: Scale the stateless application horizontally behind a load balancer.
+List Bullet: Handle link updates, disablement, deletion, expiration, and cache invalidation deliberately.
+List Bullet: Support asynchronous analytics and background work without putting it on the redirect critical path.
+List Bullet: Measure latency, throughput, cache behavior, resource use, and failures under load.
+Heading 2: 2.2 Scope boundaries
+List Bullet: A CDN is optional and should cache only redirects whose cache policy is safe for their expiration and revocation requirements.
+List Bullet: A message queue is optional for the basic redirect service; it becomes useful when analytics, notifications, or other asynchronous tasks are required.
+List Bullet: Kafka, RabbitMQ, or Redis Streams are alternatives, not components that must all be deployed.
+List Bullet: ZooKeeper is not required for the core architecture.
+List Bullet: The architecture diagram is a blueprint; it does not prove the target RPS or latency.
+Heading 1: 3. High-Level Architecture
+Normal: The system is composed of the following logical layers:
+Heading 2: 3.1 Architecture diagram
+Normal: Figure 1. Agreed high-level architecture; performance values shown are targets for validation.
+Heading 1: 4. Technology Stack and Rationale
+Heading 1: 5. Data Model and Persistence
+Heading 2: 5.1 URL mapping table
+Normal: A starting schema can contain the following fields. The exact schema should be refined based on product requirements.
+Heading 2: 5.2 Database rules
+List Bullet: Create a UNIQUE constraint or unique index on short_code. The database constraint is the final protection against collisions.
+List Bullet: Use parameterized queries; never build SQL by concatenating user input.
+List Bullet: Use a properly sized connection pool and reuse connections instead of opening a new connection per request.
+List Bullet: Use the primary for writes. Read replicas are optional and should only be used after consistency requirements and replication lag are understood.
+List Bullet: A redirect cache miss should execute an indexed lookup, not a table scan.
+List Bullet: If strict link-update consistency matters, define how cache entries are invalidated and how missed invalidation messages are repaired.
+Heading 1: 6. Short-Code Generation
+Normal: The short code must be compact, URL-safe, and unique. A practical approach is to generate a random or otherwise collision-resistant candidate, attempt the insert under the unique constraint, and retry with a new candidate if the database reports a uniqueness conflict.
+Heading 2: 6.1 Design considerations
+List Bullet: Use a URL-safe alphabet, such as letters and digits, and define the code length based on expected link volume and acceptable collision probability.
+List Bullet: Do not assume that checking Redis before insertion guarantees uniqueness; concurrent requests can race. The database unique constraint must decide the winner.
+List Bullet: Avoid sequential codes if they expose link volume or make enumeration easy; random codes reduce predictability but do not replace authorization controls.
+List Bullet: Rate-limit URL creation and validate allowed schemes. Normally accept http and https only unless product requirements explicitly state otherwise.
+List Bullet: Return a clear conflict/retry outcome internally and retry safely when a candidate collides.
+Heading 1: 7. URL Creation Flow — POST /api/shorten
+Normal: Purpose: convert a submitted long URL into a durable short URL.
+List Number: The client submits the original URL over HTTPS.
+List Number: NGINX applies edge/request controls and forwards the request to a healthy Fastify instance.
+List Number: The API validates the URL, checks allowed schemes and input length, and applies rate limits.
+List Number: The application generates a candidate short code.
+List Number: The application inserts the mapping into PostgreSQL using a parameterized query. The unique constraint resolves code collisions; retry with a new candidate when necessary.
+List Number: Only after the database commit succeeds, the application populates Redis with short_code → original_url and an appropriate TTL where caching is suitable.
+List Number: If L1 warming is useful, populate the local cache for the instance handling the request; this is an optimization, not a requirement for correctness.
+List Number: If a reliable link-created event is required, write an outbox record in the same database transaction and publish it asynchronously from an outbox relay. Do not claim reliable delivery from a best-effort fire-and-forget publish alone.
+List Number: Return the short URL to the client after durable persistence succeeds. Queue processing should not be required for the user to receive the short URL unless the product explicitly requires it.
+Heading 1: 8. URL Redirection Flow — GET /:code
+Normal: Purpose: resolve a short code quickly and return a redirect response.
+List Number: The client requests the short URL.
+List Number: The load balancer routes the request to a healthy Fastify instance.
+List Number: Validate the code's format and reject malformed input cheaply.
+List Number: Check the instance-local bounded L1 LRU cache. On a hit, obtain the destination and return the redirect response.
+List Number: On an L1 miss, query shared Redis (L2). On a hit, populate L1 with the destination and TTL, then return the redirect response.
+List Number: On an L2 miss, perform a parameterized indexed lookup in PostgreSQL. Check whether the link exists, is active, and has not expired.
+List Number: If found and eligible, populate Redis and L1 according to the cache policy, then return the redirect.
+List Number: If the code is missing, disabled, or expired, return the appropriate not-found/gone response. Do not redirect to an untrusted or fallback destination.
+List Number: Publish click analytics asynchronously only if analytics are enabled. The redirect response must not wait for analytics processing.
+List Number: Use request coalescing/single-flight for concurrent misses of the same key, TTL jitter, and carefully bounded negative caching to reduce stampedes and repeated invalid-code lookups.
+Heading 2: 8.1 Redirect status and caching
+List Bullet: Use 302 by default for editable links because it is a temporary redirect and is generally less likely than a permanent redirect to be cached indefinitely by clients.
+List Bullet: A 301 may be appropriate for links that are truly permanent, but it can be cached by browsers and intermediaries, making later changes harder to observe.
+List Bullet: Set explicit cache headers based on link mutability, expiry, and revocation requirements. A CDN is optional and must cache only responses whose policy is safe.
+List Bullet: A 302 response does not inherently mean the browser must never cache it; caching depends on response headers and intermediary policy.
+Heading 1: 9. Latency Optimization Strategy
+Heading 2: 9.1 Two-level caching
+Normal: L1 is a bounded in-process LRU cache on each Fastify instance. L2 is shared Redis. The intended lookup order is L1 → Redis → PostgreSQL. Popular keys can be served from L1 without a network round trip; Redis prevents each instance from independently querying PostgreSQL for common keys.
+List Bullet: Bound L1 by entry count or memory budget; select TTLs based on link behavior.
+List Bullet: Use TTL jitter to avoid large groups of keys expiring simultaneously.
+List Bullet: Invalidate both shared and local entries when a destination changes or a link is disabled/deleted.
+List Bullet: Because Redis Pub/Sub is not durable, use bounded TTLs and consider versioned entries, a durable invalidation stream, or reconciliation if stronger consistency is required.
+Heading 2: 9.2 Keep the redirect handler minimal
+List Bullet: Perform code validation, lookup, minimal eligibility checks, and the redirect response.
+List Bullet: Do not synchronously update analytics counters or run unrelated queries on every redirect.
+List Bullet: Avoid calling an authentication service for every public redirect unless access policy requires it.
+List Bullet: Avoid expensive synchronous logging on the success path; keep structured error logs and aggregated metrics.
+Heading 2: 9.3 PostgreSQL cache-miss path
+List Bullet: Use a unique index on short_code and verify query plans.
+List Bullet: Reuse pooled connections; never create a new database connection per redirect.
+List Bullet: Keep Redis and PostgreSQL geographically close to application instances where practical.
+List Bullet: Watch query rate, query latency, pool wait time, pool saturation, and replication lag.
+List Bullet: Consider PgBouncer when application instance count or connection churn would otherwise overload PostgreSQL.
+Heading 2: 9.4 Cache stampede prevention
+List Bullet: Single-flight/request coalescing: within one application instance, let one lookup refresh a missing key while concurrent requests await the same result.
+List Bullet: TTL jitter: vary expiration slightly to spread refreshes.
+List Bullet: Negative caching: cache nonexistent codes briefly to prevent repeated database reads, with strict TTL and memory limits.
+List Bullet: Protect negative caching from random, attacker-generated keys through input validation, rate limits, size bounds, and abuse monitoring.
+List Bullet: Distributed refresh coordination may be added only if measurements show per-instance single-flight is insufficient.
+Heading 2: 9.5 Horizontal scaling and connection reuse
+List Bullet: Run multiple stateless Fastify instances behind NGINX or a managed load balancer.
+List Bullet: Use health checks and remove unhealthy instances from rotation.
+List Bullet: Reuse HTTP and database connections; tune keep-alive and timeout settings based on load testing.
+List Bullet: Scale application, Redis, and PostgreSQL independently based on observed bottlenecks, not by adding infrastructure preemptively.
+List Bullet: A CDN can reduce origin traffic for eligible redirects, but it is not a substitute for a correct origin cache path.
+Heading 1: 10. Cache Invalidation and Link Lifecycle
+Normal: Updates, disablement, deletion, and expiry need explicit semantics so caches do not continue serving a stale destination.
+List Number: Persist the link update or disabled/deleted state in PostgreSQL.
+List Number: Delete or update the relevant Redis key.
+List Number: Publish an invalidation message through Redis Pub/Sub so application instances can evict their local L1 entry.
+List Number: Because Pub/Sub does not retain messages for disconnected subscribers, every L1 cache must have a bounded TTL; use a more robust invalidation mechanism if the consistency requirement demands it.
+List Number: For important lifecycle events, use a transactional outbox so the database change and intent to publish are recorded atomically.
+List Number: For expired links, check expires_at at the authoritative lookup and use TTL/cleanup as optimization. Cache TTL alone should not be the sole correctness check where expiry enforcement is strict.
+Heading 1: 11. Asynchronous Queue and Background Workers
+Normal: A queue is not required to resolve a URL. It becomes useful when the service needs analytics, reports, notifications, cleanup, or other work that should be processed independently of the user-facing request.
+Heading 2: 11.1 Queue reliability
+List Bullet: Choose one queue technology based on requirements; do not deploy Kafka, RabbitMQ, and Redis Streams together without a clear reason.
+List Bullet: Use acknowledgements/consumer offsets, retry with exponential backoff, and dead-letter handling where supported.
+List Bullet: Make workers idempotent because at-least-once delivery can produce duplicate events.
+List Bullet: Use a transactional outbox for critical events that must not be lost between a database commit and queue publication.
+List Bullet: For click analytics, decide whether best-effort loss is acceptable or whether events must be durable. That decision determines how the event is recorded and published.
+List Bullet: Queue publication must not block the 302 redirect response. If durable click capture is mandatory, design an explicit durable handoff and measure its latency; do not assume asynchronous code is automatically reliable or non-blocking.
+Heading 1: 12. Failure Handling and Reliability
+Heading 1: 13. Security and Input Safety
+List Bullet: Accept only intended URL schemes (normally HTTP and HTTPS); reject javascript:, data:, file:, and other unsafe schemes.
+List Bullet: Normalize and validate URL syntax and enforce a maximum input length.
+List Bullet: Use parameterized SQL queries to prevent SQL injection.
+List Bullet: Apply rate limits to URL creation and potentially to redirect requests when abuse patterns warrant it.
+List Bullet: Avoid exposing internal database errors or stack traces to clients.
+List Bullet: Use HTTPS and secure secret/configuration handling.
+List Bullet: Consider abuse, phishing, malware reports, and destination blocklists as product requirements evolve.
+List Bullet: Do not fetch user-submitted URLs from the server as part of ordinary shortening; doing so can introduce SSRF risk unless carefully designed.
+Heading 1: 14. Monitoring and Observability
+Normal: Use structured logging and aggregate metrics. Avoid verbose logging for every successful redirect if it materially increases latency or cost; retain useful error logs, sampled traces, and aggregate counters.
+Heading 1: 15. Performance Targets and Load Testing
+Heading 2: 15.1 Load-test scenarios
+List Bullet: Warm-cache steady state: repeat realistic popular short codes and test sustained throughput.
+List Bullet: Cold-cache startup: begin with empty L1 and Redis caches to measure database miss pressure.
+List Bullet: Zipf-like/hot-key traffic: simulate a small number of very popular links and many less-popular links.
+List Bullet: High-cardinality traffic: many unique codes to stress Redis, PostgreSQL, and connection pools.
+List Bullet: Invalid-code traffic: test negative caching, rate limits, and protection against random-key abuse.
+List Bullet: Cache expiration/stampede: expire popular keys together and verify single-flight, TTL jitter, and database protection.
+List Bullet: Redis failure: measure fallback behavior and ensure PostgreSQL is not overwhelmed by uncontrolled cache misses.
+List Bullet: Database pool saturation: observe queueing, timeouts, errors, and recovery.
+List Bullet: Queue/worker slowdown: verify that analytics backlog does not increase redirect latency and that retry handling works.
+List Bullet: Horizontal scale test: add and remove application instances and observe throughput, latency, and connection pressure.
+Heading 2: 15.2 What to record
+List Bullet: Achieved RPS, request failures, timeout rate, and p50/p95/p99 latency.
+List Bullet: L1 and L2 hit rates, Redis latency, PostgreSQL query count and latency.
+List Bullet: CPU, memory, event-loop lag, garbage collection, and network utilization.
+List Bullet: Database pool utilization, connection wait time, and database CPU/IO.
+List Bullet: Queue depth, oldest event age, retries, dead-letter count, and worker throughput.
+List Bullet: The exact instance counts, machine sizes, region, cache state, traffic distribution, and load generator configuration.
+Heading 1: 16. Deployment and Scaling Guidance
+List Bullet: Start with a small number of Fastify instances and scale horizontally based on measured CPU, event-loop lag, latency, and throughput.
+List Bullet: Keep app instances stateless; local L1 cache is disposable and should not be the source of truth.
+List Bullet: Deploy Redis with an availability and persistence configuration appropriate for a cache; do not assume cache replication alone replaces PostgreSQL durability.
+List Bullet: Deploy PostgreSQL with backups, monitoring, tested restore procedures, and a connection budget that accounts for every application instance and worker.
+List Bullet: Use multi-AZ deployment when availability requirements and budget justify it.
+List Bullet: Keep the CDN optional until cache headers and link revocation semantics are explicit.
+List Bullet: Add queue and worker infrastructure when an actual asynchronous use case justifies the operational cost.
+Heading 1: 17. Key Design Decisions and Trade-offs
+Heading 1: 18. Implementation Roadmap
+List Number: Phase 1 — Functional core: React/JSX UI, Fastify API, URL validation, unique code generation, PostgreSQL persistence, and 302 redirect.
+List Number: Phase 2 — Cache-first retrieval: Redis L2, bounded local LRU L1, TTL policies, cache-miss fallback, and basic cache metrics.
+List Number: Phase 3 — Correct lifecycle behavior: link update/disable/expiry, invalidation broadcast, bounded TTLs, and consistency tests.
+List Number: Phase 4 — Production edge and operations: NGINX, TLS, health checks, structured logging, rate limits, alerting, and deployment automation.
+List Number: Phase 5 — Optional asynchronous features: queue, workers, analytics storage, retries, idempotency, and transactional outbox for critical events.
+List Number: Phase 6 — Performance verification: load-test scenarios, bottleneck analysis, tuning, failure injection, and repeatable reports.
+List Number: Phase 7 — Scale hardening: evaluate Redis topology, PostgreSQL read strategy, PgBouncer, multi-AZ deployment, CDN policy, and autoscaling based on observed data.
+Heading 1: 19. Final Assessment
+Normal: The agreed architecture is a sound starting blueprint for a URL shortener with a low-latency redirect path: stateless Fastify instances, local LRU plus shared Redis caching, indexed PostgreSQL persistence, NGINX load balancing, and optional asynchronous workers. The main engineering risks are cache consistency, database miss-path saturation, queue delivery semantics, cache stampedes, and the gap between theoretical design and measured capacity.
+Normal: Do not describe the service as proven to support 10,000 RPS until repeatable load tests demonstrate that throughput and the stated p95/p99 targets are met under the defined traffic mix and failure scenarios.
+Heading 1: Appendix A. Endpoint sketch
+Heading 1: Appendix B. Redirect pseudocode
+Normal: async function redirect(code, reply) {
+  if (!isValidCodeFormat(code)) return reply.code(404).send();
+
+  let destination = l1Cache.get(code);
+  if (destination) return reply.redirect(destination, 302);
+
+  destination = await redisGetWithTimeout(code);
+  if (destination) {
+    l1Cache.set(code, destination, boundedTtlWithJitter());
+    return reply.redirect(destination, 302);
+  }
+
+  const mapping = await findByIndexedShortCode(code); // parameterized query
+  if (!mapping || !isActiveAndUnexpired(mapping)) {
+    await negativeCacheIfSafe(code);
+    return reply.code(404).send();
+  }
+
+  await populateL2AndL1(mapping); // best-effort cache population
+  enqueueClickEventAccordingToDeliveryPolicy(mapping); // must not delay 302
+  return reply.redirect(mapping.original_url, 302);
+}
+

@@ -1,0 +1,155 @@
+services:
+  # ─── Load Balancer (NGINX) ──────────────────────────────────────────
+  # Per §3 Table 3, §4 Table 4, and §9.5: Reverse proxy, traffic distribution,
+  # rate limiting, and passive health checks across application instances.
+  nginx:
+    image: nginx:alpine
+    container_name: url_shortener_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app1
+      - app2
+    networks:
+      - platform_net
+
+  # ─── Fastify Application Instance 1 ─────────────────────────────────
+  # Stateless application instance running API routes & redirect critical path.
+  app1:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: url_shortener_app1
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+      - BASE_URL=http://localhost
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=urlshortener
+      - PGPASSWORD=changeme_pg_password
+      - PGDATABASE=urlshortener
+      - PG_POOL_MIN=2
+      - PG_POOL_MAX=20
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - platform_net
+
+  # ─── Fastify Application Instance 2 (Horizontal Scaling) ────────────
+  # Per §9.5: "Run multiple stateless Fastify instances behind NGINX"
+  app2:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: url_shortener_app2
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+      - BASE_URL=http://localhost
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=urlshortener
+      - PGPASSWORD=changeme_pg_password
+      - PGDATABASE=urlshortener
+      - PG_POOL_MIN=2
+      - PG_POOL_MAX=20
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - platform_net
+
+  # ─── Background Worker ──────────────────────────────────────────────
+  # Per §11, §11.1, Table 7: Consumes Redis Streams events, outbox relay,
+  # click analytics aggregation, and periodic expired link cleanup.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: url_shortener_worker
+    restart: unless-stopped
+    entrypoint: ["dumb-init", "--", "node", "src/workers/worker.js"]
+    environment:
+      - NODE_ENV=production
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=urlshortener
+      - PGPASSWORD=changeme_pg_password
+      - PGDATABASE=urlshortener
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - platform_net
+
+  # ─── PostgreSQL 16 (Source of Truth) ────────────────────────────────
+  # Per §5.1, §5.2: Durable URL mappings, unique index on short_code,
+  # transactional outbox for reliable event delivery.
+  postgres:
+    image: postgres:16-alpine
+    container_name: url_shortener_postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=urlshortener
+      - POSTGRES_PASSWORD=changeme_pg_password
+      - POSTGRES_DB=urlshortener
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/src/db/migrations/001_create_urls.sql:/docker-entrypoint-initdb.d/001_create_urls.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U urlshortener -d urlshortener"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    networks:
+      - platform_net
+
+  # ─── Redis 7 (Shared L2 Cache & Streams Queue) ──────────────────────
+  # Per §9.1: Shared cache with TTL, negative caching, and Pub/Sub channel.
+  # Per §11.1: Redis Streams for persistent async event queue.
+  redis:
+    image: redis:7-alpine
+    container_name: url_shortener_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    networks:
+      - platform_net
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  platform_net:
+    driver: bridge
