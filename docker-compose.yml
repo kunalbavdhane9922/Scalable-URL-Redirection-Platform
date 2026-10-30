@@ -1,150 +1,276 @@
-services:
-  # ─── Load Balancer (NGINX) ──────────────────────────────────────────
-  # Per §3 Table 3, §4 Table 4, and §9.5: Reverse proxy, traffic distribution,
-  # rate limiting, and passive health checks across application instances.
-  nginx:
-    image: nginx:alpine
-    container_name: url_shortener_nginx
-    restart: unless-stopped
-    ports:
-      - "80:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      - app1
-      - app2
-    networks:
-      - platform_net
+# ─────────────────────────────────────────────────────────────────────
+# Production stack for the URL redirection platform.
+#
+#   Cloudflare (TLS/WAF/CDN) → cloudflared tunnel → edge nginx
+#     ├── /            → React static app
+#     └── /api, /:code → Fastify app1 + app2
+#                           ├── Redis L2 / Streams
+#                           └── PostgreSQL + worker
+#
+# Usage:
+#   cp .env.production.example .env   # fill in real secrets
+#   docker compose up -d --build
+#   docker compose --profile tunnel up -d   # when using Cloudflare Tunnel
+# ─────────────────────────────────────────────────────────────────────
 
-  # ─── Fastify Application Instance 1 ─────────────────────────────────
-  # Stateless application instance running API routes & redirect critical path.
+name: url-shortener
+
+x-app-env: &app-env
+  NODE_ENV: production
+  HOST: 0.0.0.0
+  PORT: "3000"
+  BASE_URL: ${BASE_URL:?Set BASE_URL in .env (https://your-domain)}
+  APP_URL: ${BASE_URL}
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  TRUST_PROXY: "true"
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  ADMIN_API_KEY: ${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env (32+ random chars)}
+  SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env (32+ random chars)}
+  SESSION_TTL_DAYS: ${SESSION_TTL_DAYS:-30}
+  SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-shortly_session}
+  AUTH_DEV_LOGIN: ${AUTH_DEV_LOGIN:-false}
+  AUTH_REQUIRE_EMAIL_VERIFICATION: ${AUTH_REQUIRE_EMAIL_VERIFICATION:-false}
+  PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-10}
+  OAUTH_CALLBACK_BASE: ${OAUTH_CALLBACK_BASE:-}
+  GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+  GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+  GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+  GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_SECURE: ${SMTP_SECURE:-false}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASS: ${SMTP_PASS:-}
+  MAIL_FROM: ${MAIL_FROM:-Shortly <no-reply@localhost>}
+  METRICS_TOKEN: ${METRICS_TOKEN:-}
+  METRICS_PUBLIC: ${METRICS_PUBLIC:-false}
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGUSER: ${PGUSER:-urlshortener}
+  PGPASSWORD: ${PGPASSWORD:?Set PGPASSWORD in .env}
+  PGDATABASE: ${PGDATABASE:-urlshortener}
+  PG_POOL_MIN: ${PG_POOL_MIN:-2}
+  PG_POOL_MAX: ${PG_POOL_MAX:-20}
+  PG_STATEMENT_TIMEOUT_MS: ${PG_STATEMENT_TIMEOUT_MS:-5000}
+  PG_QUERY_TIMEOUT_MS: ${PG_QUERY_TIMEOUT_MS:-4000}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+  REDIS_COMMAND_TIMEOUT_MS: ${REDIS_COMMAND_TIMEOUT_MS:-1000}
+  L1_MAX_ENTRIES: ${L1_MAX_ENTRIES:-20000}
+  L1_DEFAULT_TTL_MS: ${L1_DEFAULT_TTL_MS:-60000}
+  L2_DEFAULT_TTL_SECONDS: ${L2_DEFAULT_TTL_SECONDS:-3600}
+  RATE_LIMIT_SHORTEN_MAX: ${RATE_LIMIT_SHORTEN_MAX:-20}
+  RATE_LIMIT_REDIRECT_MAX: ${RATE_LIMIT_REDIRECT_MAX:-1200}
+  RATE_LIMIT_MANAGE_MAX: ${RATE_LIMIT_MANAGE_MAX:-240}
+  RATE_LIMIT_AUTH_MAX: ${RATE_LIMIT_AUTH_MAX:-20}
+  RATE_LIMIT_AUTH_WINDOW_MS: ${RATE_LIMIT_AUTH_WINDOW_MS:-300000}
+  QUEUE_STREAM_KEY: url_shortener:events
+  QUEUE_CONSUMER_GROUP: workers
+  QUEUE_BATCH_SIZE: ${QUEUE_BATCH_SIZE:-100}
+  QUEUE_MAX_RETRIES: ${QUEUE_MAX_RETRIES:-3}
+  CLICK_BUFFER_MAX_BATCH: ${CLICK_BUFFER_MAX_BATCH:-250}
+
+services:
+  # ─── PostgreSQL: source of truth ──────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PGUSER:-urlshortener}
+      POSTGRES_PASSWORD: ${PGPASSWORD:?Set PGPASSWORD in .env}
+      POSTGRES_DB: ${PGDATABASE:-urlshortener}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-768MB}
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - log_min_duration_statement=500
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    networks: [platform_net]
+
+  # ─── Redis: L2 cache, rate limits, streams, pub/sub ───────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    command:
+      - sh
+      - -c
+      - >
+        exec redis-server
+        --appendonly yes
+        --appendfsync everysec
+        --requirepass "$$REDIS_PASSWORD"
+        --maxmemory ${REDIS_MAXMEMORY:-256mb}
+        --maxmemory-policy volatile-lru
+        --save 900 1
+        --tcp-keepalive 60
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks: [platform_net]
+
+  # ─── Schema migrations (runs once, then exits) ────────────────────
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["node", "src/db/migrate.js"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [platform_net]
+
+  # ─── Stateless Fastify instances behind nginx ─────────────────────
   app1:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: url_shortener_app1
     restart: unless-stopped
     environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - HOST=0.0.0.0
-      - BASE_URL=http://localhost
-      - PGHOST=postgres
-      - PGPORT=5432
-      - PGUSER=urlshortener
-      - PGPASSWORD=changeme_pg_password
-      - PGDATABASE=urlshortener
-      - PG_POOL_MIN=2
-      - PG_POOL_MAX=20
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - LOG_LEVEL=info
+      <<: *app-env
+      QUEUE_CONSUMER_NAME: api-1
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
-    networks:
-      - platform_net
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    stop_grace_period: 15s
+    networks: [platform_net]
 
-  # ─── Fastify Application Instance 2 (Horizontal Scaling) ────────────
-  # Per §9.5: "Run multiple stateless Fastify instances behind NGINX"
   app2:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: url_shortener_app2
     restart: unless-stopped
     environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - HOST=0.0.0.0
-      - BASE_URL=http://localhost
-      - PGHOST=postgres
-      - PGPORT=5432
-      - PGUSER=urlshortener
-      - PGPASSWORD=changeme_pg_password
-      - PGDATABASE=urlshortener
-      - PG_POOL_MIN=2
-      - PG_POOL_MAX=20
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - LOG_LEVEL=info
+      <<: *app-env
+      QUEUE_CONSUMER_NAME: api-2
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
-    networks:
-      - platform_net
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    stop_grace_period: 15s
+    networks: [platform_net]
 
-  # ─── Background Worker ──────────────────────────────────────────────
-  # Per §11, §11.1, Table 7: Consumes Redis Streams events, outbox relay,
-  # click analytics aggregation, and periodic expired link cleanup.
+  # ─── Background worker: streams, outbox, analytics, expiry ────────
   worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: url_shortener_worker
+    command: ["node", "src/workers/worker.js"]
     restart: unless-stopped
-    entrypoint: ["dumb-init", "--", "node", "src/workers/worker.js"]
     environment:
-      - NODE_ENV=production
-      - PGHOST=postgres
-      - PGPORT=5432
-      - PGUSER=urlshortener
-      - PGPASSWORD=changeme_pg_password
-      - PGDATABASE=urlshortener
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - LOG_LEVEL=info
+      <<: *app-env
+      WORKER_HEALTH_PORT: "3001"
+      QUEUE_CONSUMER_NAME: worker-1
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
-    networks:
-      - platform_net
-
-  # ─── PostgreSQL 16 (Source of Truth) ────────────────────────────────
-  # Per §5.1, §5.2: Durable URL mappings, unique index on short_code,
-  # transactional outbox for reliable event delivery.
-  postgres:
-    image: postgres:16-alpine
-    container_name: url_shortener_postgres
-    restart: unless-stopped
-    environment:
-      - POSTGRES_USER=urlshortener
-      - POSTGRES_PASSWORD=changeme_pg_password
-      - POSTGRES_DB=urlshortener
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./backend/src/db/migrations/001_create_urls.sql:/docker-entrypoint-initdb.d/001_create_urls.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U urlshortener -d urlshortener"]
-      interval: 3s
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3001/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
       timeout: 3s
       retries: 5
-    networks:
-      - platform_net
+      start_period: 10s
+    stop_grace_period: 20s
+    networks: [platform_net]
 
-  # ─── Redis 7 (Shared L2 Cache & Streams Queue) ──────────────────────
-  # Per §9.1: Shared cache with TTL, negative caching, and Pub/Sub channel.
-  # Per §11.1: Redis Streams for persistent async event queue.
-  redis:
-    image: redis:7-alpine
-    container_name: url_shortener_redis
+  # ─── React static app ─────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 3s
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null || exit 1"]
+      interval: 30s
       timeout: 3s
-      retries: 5
-    networks:
-      - platform_net
+      retries: 3
+    networks: [platform_net]
+
+  # ─── Edge reverse proxy (public entrypoint inside the network) ────
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:${EDGE_PORT:-8080}:80"
+    depends_on:
+      app1:
+        condition: service_healthy
+      app2:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health/live >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+    networks: [platform_net]
+
+  # ─── Cloudflare Tunnel (optional profile) ─────────────────────────
+  # Create a tunnel in the Cloudflare dashboard, point its public
+  # hostname at http://nginx:80, then set TUNNEL_TOKEN in .env.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${TUNNEL_TOKEN:-}"]
+    depends_on:
+      nginx:
+        condition: service_healthy
+    networks: [platform_net]
 
 volumes:
   pgdata:

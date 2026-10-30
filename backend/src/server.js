@@ -1,49 +1,64 @@
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
+import underPressure from '@fastify/under-pressure';
 import config from './config.js';
 
-// Plugins
 import postgresPlugin from './plugins/postgres.js';
 import redisPlugin from './plugins/redis.js';
 import rateLimitPlugin from './plugins/rate-limit.js';
+import authPlugin from './plugins/auth.js';
+import metricsPlugin, { metricsRoute } from './plugins/metrics.js';
 
-// Cache invalidation listener
 import { setupInvalidationListener } from './cache/invalidation.js';
+import { closeClickBuffer } from './services/queue-service.js';
 
-// Routes
 import healthRoutes from './routes/health.js';
 import shortenRoutes from './routes/shorten.js';
 import linksRoutes from './routes/links.js';
-import uiRoutes from './routes/ui.js';
 import redirectRoutes from './routes/redirect.js';
+import authRoutes from './routes/auth.js';
 
-// Error types
 import { AppError } from './utils/errors.js';
 
-/**
- * Fastify application server.
- *
- * Per document §4 (Table 4):
- *  - "Low-overhead routing, schema validation support, and configurable
- *     structured logging."
- *
- * Per document §14:
- *  - "Use structured logging and aggregate metrics."
- *  - "Avoid verbose logging for every successful redirect."
- *
- * Per document §16:
- *  - "Keep app instances stateless; local L1 cache is disposable."
- */
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{8,128}$/;
+
+function resolveRequestId(request) {
+  const incoming = request.headers['x-request-id'];
+  if (typeof incoming === 'string' && REQUEST_ID_PATTERN.test(incoming)) return incoming;
+  return randomUUID();
+}
+
+function buildCorsOrigin() {
+  if (!config.isProduction) return true;
+  const allowed = config.cors.origins.length > 0
+    ? config.cors.origins
+    : [config.appUrl, config.baseUrl];
+  return (origin, callback) => {
+    // Same-origin requests and server-to-server calls have no Origin header.
+    if (!origin) return callback(null, true);
+    // Answer without CORS headers instead of throwing: the browser blocks the
+    // response, and the auth hook rejects unsafe methods with a clean 403.
+    return callback(null, allowed.includes(origin));
+  };
+}
 
 async function buildServer(opts = {}) {
   const fastify = Fastify({
     logger: opts.logger !== undefined ? opts.logger : {
       level: config.logLevel,
-      // Structured logging via pino (built into Fastify)
-      // Per §14: structured logs, not verbose per-request logging on success path
+      redact: {
+        paths: [
+          'req.headers.authorization',
+          'req.headers["x-api-key"]',
+          'req.headers.cookie',
+          'res.headers["set-cookie"]',
+        ],
+        censor: '[REDACTED]',
+      },
       serializers: {
         req(request) {
           return {
@@ -54,36 +69,55 @@ async function buildServer(opts = {}) {
           };
         },
         res(reply) {
-          return {
-            statusCode: reply.statusCode,
-          };
+          return { statusCode: reply.statusCode };
         },
       },
     },
-    // Trust proxy (NGINX sits in front per architecture)
-    trustProxy: true,
-    // Request timeout
+    genReqId: resolveRequestId,
+    requestIdHeader: 'x-request-id',
+    trustProxy: config.trustProxy,
+    bodyLimit: config.bodyLimitBytes,
+    routerOptions: { maxParamLength: 64 },
     connectionTimeout: 10000,
-    // Disable verbose request logging in production
-    disableRequestLogging: config.env === 'production',
+    keepAliveTimeout: 72000,
+    requestTimeout: 15000,
+    logController: new Fastify.LogController({
+      requestIdLogLabel: 'reqId',
+      disableRequestLogging: config.isProduction,
+    }),
     ...opts.fastifyOptions,
   });
 
-  // ─── Security headers ───────────────────────────────────────────
-  // Per §13: "Use HTTPS and secure secret/configuration handling."
+  // ─── Security & CORS ─────────────────────────────────────────────
   await fastify.register(helmet, {
-    contentSecurityPolicy: false, // API server, not serving HTML
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
   });
 
-  // ─── CORS ───────────────────────────────────────────────────────
   await fastify.register(cors, {
-    origin: config.env === 'production'
-      ? config.baseUrl
-      : true, // Allow all origins in development
-    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+    origin: buildCorsOrigin(),
+    credentials: true,
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Request-Id', 'X-Metrics-Token'],
+    exposedHeaders: ['X-Request-Id', 'Retry-After'],
+    maxAge: 86400,
   });
 
-  // ─── Infrastructure plugins ─────────────────────────────────────
+  // ─── Observability & load shedding ───────────────────────────────
+  await fastify.register(metricsPlugin);
+
+  if (!opts.skipUnderPressure) {
+    await fastify.register(underPressure, {
+      maxEventLoopDelay: 2000,
+      maxMemoryUsed: 1.5 * 1024 * 1024 * 1024,
+      maxEventLoopUtilization: 0.99,
+      retryAfter: 2,
+      message: 'Service under heavy load, please retry shortly',
+      exposeStatusRoute: false,
+    });
+  }
+
+  // ─── Infrastructure ─────────────────────────────────────────────
   if (opts.pg) {
     fastify.decorate('pg', opts.pg);
   } else {
@@ -98,78 +132,114 @@ async function buildServer(opts = {}) {
     await fastify.register(redisPlugin);
   }
 
+  await fastify.register(authPlugin);
+
   if (!opts.skipRateLimit) {
     await fastify.register(rateLimitPlugin);
   }
 
   // ─── Cache invalidation subscriber ──────────────────────────────
-  // Per §10 step 3: "Publish an invalidation message through Redis Pub/Sub
-  // so application instances can evict their local L1 entry."
   fastify.addHook('onReady', async () => {
     if (fastify.redisSub && typeof fastify.redisSub.subscribe === 'function') {
       setupInvalidationListener(fastify.redisSub, fastify.log);
     }
   });
 
-  // ─── Global error handler ──────────────────────────────────────
-  // Per §13: "Avoid exposing internal database errors or stack traces to clients."
+  // ─── Response request ID ────────────────────────────────────────
+  fastify.addHook('onSend', async (request, reply, payload) => {
+    reply.header('X-Request-Id', request.id);
+    return payload;
+  });
+
+  // ─── Error handling ─────────────────────────────────────────────
   fastify.setErrorHandler((error, request, reply) => {
-    // Handle known application errors
+    const requestId = request.id;
+
     if (error instanceof AppError) {
+      if (error.statusCode === 503) {
+        reply.header('Retry-After', '2');
+      }
       return reply.code(error.statusCode).send({
         statusCode: error.statusCode,
         error: error.code,
         message: error.message,
+        requestId,
       });
     }
 
-    // Handle Fastify validation errors
     if (error.validation) {
       return reply.code(400).send({
         statusCode: 400,
         error: 'VALIDATION_ERROR',
         message: error.message,
+        requestId,
       });
     }
 
-    // Handle rate limit errors from @fastify/rate-limit
     if (error.statusCode === 429) {
+      reply.header('Retry-After', '60');
       return reply.code(429).send({
         statusCode: 429,
         error: 'RATE_LIMIT_EXCEEDED',
         message: error.message,
+        requestId,
       });
     }
 
-    // Unknown/internal errors — log but do not expose details
-    fastify.log.error({ err: error }, 'Unhandled error');
+    if (error.statusCode === 503) {
+      reply.header('Retry-After', '2');
+      return reply.code(503).send({
+        statusCode: 503,
+        error: 'SERVICE_UNAVAILABLE',
+        message: error.message || 'Service temporarily unavailable',
+        requestId,
+      });
+    }
 
+    request.log.error({ err: error, reqId: requestId }, 'Unhandled error');
     return reply.code(500).send({
       statusCode: 500,
       error: 'INTERNAL_ERROR',
       message: 'An unexpected error occurred',
+      requestId,
+    });
+  });
+
+  fastify.setNotFoundHandler((request, reply) => {
+    reply.code(404).send({
+      statusCode: 404,
+      error: 'NOT_FOUND',
+      message: 'Route not found',
+      requestId: request.id,
     });
   });
 
   // ─── Routes ─────────────────────────────────────────────────────
-  // Health check routes first (no auth required, exempt from rate limiting)
-  await fastify.register(healthRoutes);
+  fastify.get('/', { config: { rateLimit: false } }, async (request, reply) => {
+    return reply.send({
+      service: 'Scalable URL Redirection Platform',
+      status: 'ok',
+      docs: '/health',
+      version: 2,
+    });
+  });
 
-  // API routes
+  await fastify.register(healthRoutes);
+  await fastify.register(metricsRoute);
+  await fastify.register(authRoutes);
   await fastify.register(shortenRoutes);
   await fastify.register(linksRoutes);
 
-  // UI routes for serving the frontend dashboard
-  await fastify.register(uiRoutes);
-
-  // Redirect route MUST be registered last because /:code is a catch-all param.
-  // Per §9.2: "Keep the redirect handler minimal"
+  // Redirect catch-all must be registered last.
   await fastify.register(redirectRoutes);
+
+  // Flush buffered analytics before the Redis client is closed.
+  fastify.addHook('onClose', async () => {
+    await closeClickBuffer(fastify.redis, fastify.log);
+  });
 
   return fastify;
 }
-
-// ─── Start server ─────────────────────────────────────────────────────
 
 async function start() {
   let server;
@@ -182,18 +252,41 @@ async function start() {
     process.exit(1);
   }
 
-  // ─── Graceful shutdown ────────────────────────────────────────────
+  let shuttingDown = false;
   const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     server.log.info({ signal }, 'Graceful shutdown initiated');
-    await server.close();
-    process.exit(0);
+
+    const forceExit = setTimeout(() => {
+      server.log.error('Shutdown timed out, forcing exit');
+      process.exit(1);
+    }, 10000);
+    forceExit.unref?.();
+
+    try {
+      await server.close();
+      clearTimeout(forceExit);
+      process.exit(0);
+    } catch (err) {
+      server.log.error({ err: err.message }, 'Error during shutdown');
+      process.exit(1);
+    }
   };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+
+  process.on('unhandledRejection', (reason) => {
+    server.log.error({ reason }, 'Unhandled promise rejection');
+  });
+
+  process.on('uncaughtException', (err) => {
+    server.log.fatal({ err: err.message }, 'Uncaught exception');
+    shutdown('uncaughtException');
+  });
 }
 
-// Only auto-start when run directly from CLI
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   start();

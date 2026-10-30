@@ -1,5 +1,5 @@
 import { queries } from '../db/queries.js';
-import { invalidateL2 } from '../services/cache-service.js';
+import { invalidateL2, setGoneCache } from '../services/cache-service.js';
 import { publishInvalidation } from '../cache/invalidation.js';
 
 /**
@@ -39,10 +39,12 @@ export async function cleanupExpiredLinks(pgPool, redis, isRedisAvailable, logge
   const ids = expired.rows.map(r => r.id);
   const result = await pgPool.query(queries.expireLinks, [ids]);
 
-  // Invalidate cache entries for expired links
+  // Invalidate cache entries for expired links and mark them gone so the
+  // redirect path can answer 410 without a database round trip.
   for (const row of result.rows) {
     try {
       await invalidateL2(redis, row.short_code);
+      setGoneCache(redis, isRedisAvailable, row.short_code, 'expired');
       if (isRedisAvailable()) {
         await publishInvalidation(redis, row.short_code, 'expire');
       }

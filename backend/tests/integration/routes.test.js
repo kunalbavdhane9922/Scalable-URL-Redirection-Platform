@@ -3,6 +3,8 @@ import { buildServer } from '../../src/server.js';
 import { createMockPgPool, createMockRedis } from '../fixtures/mock-db.js';
 import { l1Clear, l1Get } from '../../src/cache/lru-cache.js';
 
+const AUTH = { authorization: 'Bearer dev-admin-key' };
+
 describe('HTTP Routes & Redirection Platform Integration Tests', () => {
   let app;
   let mockPg;
@@ -284,6 +286,7 @@ describe('HTTP Routes & Redirection Platform Integration Tests', () => {
       const patchRes = await app.inject({
         method: 'PATCH',
         url: `/api/links/${shortCode}`,
+        headers: AUTH,
         payload: { url: 'https://updated-destination.com' },
       });
 
@@ -320,6 +323,7 @@ describe('HTTP Routes & Redirection Platform Integration Tests', () => {
       const deleteRes = await app.inject({
         method: 'DELETE',
         url: `/api/links/${shortCode}`,
+        headers: AUTH,
       });
       expect(deleteRes.statusCode).toBe(204);
 
@@ -353,13 +357,44 @@ describe('HTTP Routes & Redirection Platform Integration Tests', () => {
       const listRes = await app.inject({
         method: 'GET',
         url: '/api/links?limit=10',
+        headers: AUTH,
       });
 
       expect(listRes.statusCode).toBe(200);
       const list = JSON.parse(listRes.payload);
-      expect(list.length).toBe(2);
-      expect(list[0].short_code).toBeDefined();
-      expect(list[0].click_count).toBeDefined();
+      expect(list.items.length).toBe(2);
+      expect(list.pagination.total).toBe(2);
+      expect(list.items[0].shortCode).toBeDefined();
+      expect(list.items[0].clickCount).toBeDefined();
+    });
+
+    it('requires an API key for management endpoints', async () => {
+      const missing = await app.inject({ method: 'GET', url: '/api/links' });
+      expect(missing.statusCode).toBe(401);
+
+      const wrong = await app.inject({
+        method: 'GET',
+        url: '/api/links',
+        headers: { authorization: 'Bearer wrong-key' },
+      });
+      expect(wrong.statusCode).toBe(403);
+    });
+
+    it('supports custom aliases and rejects duplicates with 409', async () => {
+      const first = await app.inject({
+        method: 'POST',
+        url: '/api/shorten',
+        payload: { url: 'https://aliased.com', customAlias: 'my-launch' },
+      });
+      expect(first.statusCode).toBe(201);
+      expect(JSON.parse(first.payload).shortCode).toBe('my-launch');
+
+      const duplicate = await app.inject({
+        method: 'POST',
+        url: '/api/shorten',
+        payload: { url: 'https://other.com', customAlias: 'my-launch' },
+      });
+      expect(duplicate.statusCode).toBe(409);
     });
 
     it('GET /api/links/:code retrieves detailed link metadata', async () => {
@@ -373,6 +408,7 @@ describe('HTTP Routes & Redirection Platform Integration Tests', () => {
       const detailsRes = await app.inject({
         method: 'GET',
         url: `/api/links/${shortCode}`,
+        headers: AUTH,
       });
 
       expect(detailsRes.statusCode).toBe(200);
@@ -381,6 +417,64 @@ describe('HTTP Routes & Redirection Platform Integration Tests', () => {
       expect(details.originalUrl).toBe('https://detailed.com/');
       expect(details.status).toBe('active');
       expect(details.clickCount).toBe(0);
+    });
+  });
+
+  describe('Operational resilience & statistics (§11.2, §9.5)', () => {
+    it('returns 503 with Retry-After and a request id when the database lookup fails', async () => {
+      const originalQuery = mockPg.query;
+      mockPg.query = jest.fn(async (sql, params) => {
+        if (sql.includes('FROM urls') && sql.includes('short_code = $1')) {
+          throw new Error('connection refused');
+        }
+        return originalQuery(sql, params);
+      });
+
+      const res = await app.inject({ method: 'GET', url: '/db-down-code' });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.headers['retry-after']).toBe('2');
+      const body = JSON.parse(res.payload);
+      expect(body.error).toBe('SERVICE_UNAVAILABLE');
+      expect(body.requestId).toBeDefined();
+      expect(res.headers['x-request-id']).toBe(body.requestId);
+    });
+
+    it('echoes a caller-provided X-Request-Id for trace correlation', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/health/live',
+        headers: { 'x-request-id': 'trace-abc-1234' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['x-request-id']).toBe('trace-abc-1234');
+    });
+
+    it('serves public landing-page counters without an API key', async () => {
+      const res = await app.inject({ method: 'GET', url: '/api/public/stats' });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.payload);
+      expect(body.totalLinks).toBe(0);
+      expect(body.totalClicks).toBe(0);
+      expect(body.activeLinks).toBe(0);
+      expect(typeof body.uptimeSeconds).toBe('number');
+    });
+
+    it('protects platform statistics behind the admin API key', async () => {
+      const unauth = await app.inject({ method: 'GET', url: '/api/stats' });
+      expect(unauth.statusCode).toBe(401);
+
+      const res = await app.inject({ method: 'GET', url: '/api/stats', headers: AUTH });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.payload);
+      expect(body.totalLinks).toBeDefined();
+      expect(body.clicksSeries).toBeDefined();
+      expect(body.topLinks).toBeDefined();
+      expect(body.cache.l1).toBeDefined();
+      expect(body.cache.l1.positive.size).toBeDefined();
+      expect(body.cache.l1.negative.size).toBeDefined();
+      expect(body.cache.l1.gone.size).toBeDefined();
     });
   });
 });

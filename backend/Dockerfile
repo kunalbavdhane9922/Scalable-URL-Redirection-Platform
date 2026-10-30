@@ -1,33 +1,26 @@
-# Multi-stage production Dockerfile for Fastify backend instances & workers
-FROM node:22-alpine AS builder
+# Multi-stage production build for Fastify API + background worker.
+FROM node:24-alpine AS deps
 
 WORKDIR /app
-
-COPY package*.json ./
-RUN npm ci
-
-COPY . .
-
-# Production stage
-FROM node:22-alpine AS runner
-
-WORKDIR /app
-
-ENV NODE_ENV=production
-ENV PORT=3000
-ENV HOST=0.0.0.0
-
-# Install dumb-init for proper signal forwarding and PID 1 handling
-RUN apk add --no-cache dumb-init
-
-COPY package*.json ./
+COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY --from=builder /app/src ./src
+FROM node:24-alpine AS runner
 
-# Create non-root user for security
-USER node
+WORKDIR /app
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOST=0.0.0.0
 
+# dumb-init forwards signals correctly; tini-like behavior for PID 1.
+RUN apk add --no-cache dumb-init && \
+    addgroup -S app && adduser -S app -G app
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY src ./src
+
+USER app
 EXPOSE 3000
 
 ENTRYPOINT ["dumb-init", "--"]

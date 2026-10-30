@@ -1,94 +1,135 @@
 :root {
-  --bg-primary: #0a0d14;
-  --bg-secondary: #111622;
-  --bg-tertiary: #1a2234;
-  --bg-card: rgba(17, 22, 34, 0.75);
-  --border-color: rgba(255, 255, 255, 0.08);
-  --border-hover: rgba(59, 130, 246, 0.4);
-  
-  --text-primary: #f8fafc;
-  --text-secondary: #94a3b8;
-  --text-muted: #64748b;
-  
-  --accent-blue: #3b82f6;
-  --accent-cyan: #06b6d4;
-  --accent-emerald: #10b981;
-  --accent-amber: #f59e0b;
-  --accent-rose: #f43f5e;
-  --accent-purple: #8b5cf6;
-  
-  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'JetBrains Mono', monospace;
-  
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.35);
-  --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.5);
-  --shadow-glow: 0 0 20px rgba(59, 130, 246, 0.25);
-  
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 16px;
+  color-scheme: light;
+
+  --ink: #0b1220;
+  --ink-2: #263043;
+  --muted: #5b6478;
+  --muted-2: #8b94a8;
+  --line: #e6e8f0;
+  --line-strong: #d5d9e5;
+  --bg: #f6f7fb;
+  --surface: #ffffff;
+
+  --brand: #4f46e5;
+  --brand-dark: #4338ca;
+  --brand-soft: #eef1ff;
+  --cyan: #0891b2;
+  --emerald: #059669;
+  --amber: #d97706;
+  --violet: #7c3aed;
+  --rose: #e11d48;
+  --navy: #070d1b;
+  --navy-2: #0d1628;
+
+  --radius-sm: 9px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+  --radius-xl: 24px;
+
+  --shadow-sm: 0 1px 2px rgba(11, 18, 32, 0.05);
+  --shadow-md: 0 10px 30px -12px rgba(11, 18, 32, 0.16);
+  --shadow-lg: 0 30px 70px -30px rgba(11, 18, 32, 0.35);
+
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
-  margin: 0;
-  padding: 0;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
 }
 
 body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--bg);
+  color: var(--ink);
   font-family: var(--font-sans);
-  background-color: var(--bg-primary);
-  color: var(--text-primary);
-  min-height: 100vh;
-  line-height: 1.5;
+  font-size: 15px;
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  background-image: 
-    radial-gradient(ellipse at 50% -20%, rgba(59, 130, 246, 0.15), transparent 50%),
-    radial-gradient(ellipse at 100% 80%, rgba(139, 92, 246, 0.08), transparent 40%);
-  background-attachment: fixed;
+  text-rendering: optimizeLegibility;
 }
 
-code, pre {
-  font-family: var(--font-mono);
+h1, h2, h3, h4, h5, h6 {
+  margin: 0;
+  letter-spacing: -0.025em;
+  line-height: 1.18;
+  font-weight: 700;
 }
 
-button {
-  font-family: inherit;
-  cursor: pointer;
-  border: none;
-  outline: none;
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-input, select {
-  font-family: inherit;
-  outline: none;
+p {
+  margin: 0;
 }
 
 a {
-  color: var(--accent-blue);
+  color: inherit;
   text-decoration: none;
-  transition: color 0.15s ease;
 }
 
-a:hover {
-  color: #60a5fa;
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
 }
 
-/* Scrollbar customization */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+  padding: 0;
 }
-::-webkit-scrollbar-track {
-  background: var(--bg-primary);
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
-::-webkit-scrollbar-thumb {
-  background: var(--bg-tertiary);
-  border-radius: 4px;
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: var(--text-muted);
+
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+code,
+pre {
+  font-family: var(--font-mono);
+}
+
+:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: rgba(79, 70, 229, 0.18);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }

@@ -1,85 +1,32 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import Navbar from './components/Navbar.jsx';
-import UrlForm from './components/UrlForm.jsx';
-import LinkList from './components/LinkList.jsx';
-import LinkDetailsModal from './components/LinkDetailsModal.jsx';
-import SystemHealth from './components/SystemHealth.jsx';
-import { fetchHealth, fetchLinks } from './api/client.js';
-import './App.css';
+import { useEffect } from 'react';
+import { Route, Routes, useLocation } from 'react-router-dom';
+import Landing from './pages/Landing.jsx';
+import Dashboard from './pages/Dashboard.jsx';
+import AuthPage from './pages/AuthPage.jsx';
+import NotFound from './pages/NotFound.jsx';
+
+function ScrollToTop() {
+  const { pathname } = useLocation();
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }, [pathname]);
+  return null;
+}
 
 export default function App() {
-  const [health, setHealth] = useState(null);
-  const [showHealth, setShowHealth] = useState(false);
-  const [links, setLinks] = useState([]);
-  const [linksLoading, setLinksLoading] = useState(false);
-  const [selectedCode, setSelectedCode] = useState(null);
-
-  const loadHealth = useCallback(async () => {
-    try {
-      const res = await fetchHealth();
-      setHealth(res.data);
-    } catch {
-      setHealth({ status: 'unreachable', checks: { database: 'unreachable', redis: 'unreachable' } });
-    }
-  }, []);
-
-  const loadLinks = useCallback(async () => {
-    setLinksLoading(true);
-    try {
-      const data = await fetchLinks(50);
-      setLinks(Array.isArray(data) ? data : data.links || []);
-    } catch {
-      // Backend links route might be empty initially
-      setLinks([]);
-    } finally {
-      setLinksLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadHealth();
-    loadLinks();
-    const healthInterval = setInterval(loadHealth, 15000);
-    return () => clearInterval(healthInterval);
-  }, [loadHealth, loadLinks]);
-
-  const handleUrlCreated = (newMapping) => {
-    loadLinks();
-  };
-
   return (
-    <div className="app-container">
-      <Navbar
-        health={health}
-        showHealth={showHealth}
-        onToggleHealth={() => setShowHealth(!showHealth)}
-      />
-
-      <main className="main-content">
-        {showHealth && (
-          <SystemHealth
-            health={health}
-            onRefreshHealth={loadHealth}
-          />
-        )}
-
-        <UrlForm onUrlCreated={handleUrlCreated} />
-
-        <LinkList
-          links={links}
-          loading={linksLoading}
-          onRefresh={loadLinks}
-          onSelectLink={(code) => setSelectedCode(code)}
-        />
-      </main>
-
-      {selectedCode && (
-        <LinkDetailsModal
-          code={selectedCode}
-          onClose={() => setSelectedCode(null)}
-          onLinkUpdated={loadLinks}
-        />
-      )}
-    </div>
+    <>
+      <ScrollToTop />
+      <Routes>
+        <Route path="/" element={<Landing />} />
+        <Route path="/login" element={<AuthPage mode="login" />} />
+        <Route path="/register" element={<AuthPage mode="register" />} />
+        <Route path="/forgot-password" element={<AuthPage mode="forgot" />} />
+        <Route path="/reset-password" element={<AuthPage mode="reset" />} />
+        <Route path="/verify-email" element={<AuthPage mode="verify" />} />
+        <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="*" element={<NotFound />} />
+      </Routes>
+    </>
   );
 }

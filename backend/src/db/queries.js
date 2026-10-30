@@ -1,65 +1,61 @@
 /**
- * Parameterized SQL queries.
- *
- * Per document §5.2:
- *  - "Use parameterized queries; never build SQL by concatenating user input."
- *  - "A redirect cache miss should execute an indexed lookup, not a table scan."
- *
- * Every query uses $N-style placeholders and the `short_code` unique index.
+ * Parameterized SQL. Every user-controlled value is bound, never concatenated.
  */
 
 export const queries = {
-  /**
-   * Insert a new URL mapping. Relies on UNIQUE constraint on short_code
-   * for collision protection (document §6: "The database unique constraint
-   * must decide the winner").
-   */
   insertUrl: `
-    INSERT INTO urls (short_code, original_url, status, expires_at, owner_id)
+    INSERT INTO urls (short_code, original_url, status, expires_at, user_id)
     VALUES ($1, $2, $3, $4, $5)
     RETURNING id, short_code, original_url, status, created_at, expires_at
   `,
 
-  /**
-   * Indexed lookup by short_code for redirect resolution.
-   * Returns only fields needed for redirect eligibility check and response.
-   */
   findByShortCode: `
     SELECT id, short_code, original_url, status, expires_at, updated_at
     FROM urls
     WHERE short_code = $1
   `,
 
-  /**
-   * Update a link's destination URL and metadata.
-   * Per document §10: lifecycle updates must be persisted before cache invalidation.
-   */
-  updateUrl: `
+  updateUrlDestination: `
     UPDATE urls
     SET original_url = $2,
         updated_at = NOW()
-    WHERE short_code = $1 AND status = 'active'
-    RETURNING id, short_code, original_url, status, updated_at
+    WHERE short_code = $1
+      AND status = 'active'
+      AND ($3::bigint IS NULL OR user_id = $3)
+    RETURNING id, short_code, original_url, status, updated_at, expires_at
   `,
 
-  /**
-   * Disable/soft-delete a link by changing its status.
-   * Per document §10: "Persist the link update or disabled/deleted state in PostgreSQL."
-   */
+  updateUrlExpiry: `
+    UPDATE urls
+    SET expires_at = $2,
+        updated_at = NOW()
+    WHERE short_code = $1
+      AND status = 'active'
+      AND ($3::bigint IS NULL OR user_id = $3)
+    RETURNING id, short_code, original_url, status, updated_at, expires_at
+  `,
+
+  updateUrlBoth: `
+    UPDATE urls
+    SET original_url = $2,
+        expires_at = $3,
+        updated_at = NOW()
+    WHERE short_code = $1
+      AND status = 'active'
+      AND ($4::bigint IS NULL OR user_id = $4)
+    RETURNING id, short_code, original_url, status, updated_at, expires_at
+  `,
+
   disableUrl: `
     UPDATE urls
     SET status = $2,
         updated_at = NOW()
-    WHERE short_code = $1 AND status = 'active'
+    WHERE short_code = $1
+      AND status = 'active'
+      AND ($3::bigint IS NULL OR user_id = $3)
     RETURNING id, short_code, status, updated_at
   `,
 
-  /**
-   * Insert an outbox event within the same transaction as the data change.
-   * Per document §7 step 8 and §11.1: "Use a transactional outbox for
-   * critical events that must not be lost between a database commit
-   * and queue publication."
-   */
   insertOutboxEvent: `
     INSERT INTO outbox (event_type, payload)
     VALUES ($1, $2)
@@ -67,38 +63,33 @@ export const queries = {
   `,
 
   /**
-   * Fetch unpublished outbox events for the relay to process.
-   * Limited batch size to prevent overwhelming the queue.
+   * Claim unclaimed outbox rows atomically. SKIP LOCKED lets several worker
+   * replicas relay concurrently without publishing the same event twice.
    */
-  fetchUnpublishedOutboxEvents: `
-    SELECT id, event_type, payload, created_at, retries
-    FROM outbox
-    WHERE published_at IS NULL
-    ORDER BY created_at ASC
-    LIMIT $1
+  claimOutboxEvents: `
+    UPDATE outbox o
+    SET claimed_at = NOW()
+    FROM (
+      SELECT id
+      FROM outbox
+      WHERE published_at IS NULL
+        AND (claimed_at IS NULL OR claimed_at < NOW() - make_interval(secs => $2))
+      ORDER BY created_at ASC
+      LIMIT $1
+      FOR UPDATE SKIP LOCKED
+    ) AS batch
+    WHERE o.id = batch.id
+    RETURNING o.id, o.event_type, o.payload, o.created_at, o.retries
   `,
 
-  /**
-   * Mark an outbox event as published.
-   */
   markOutboxPublished: `
-    UPDATE outbox
-    SET published_at = NOW()
-    WHERE id = $1
+    UPDATE outbox SET published_at = NOW(), claimed_at = NULL WHERE id = $1
   `,
 
-  /**
-   * Increment retry count for a failed outbox publish.
-   */
-  incrementOutboxRetry: `
-    UPDATE outbox
-    SET retries = retries + 1
-    WHERE id = $1
+  releaseOutboxClaim: `
+    UPDATE outbox SET claimed_at = NULL, retries = retries + 1 WHERE id = $1
   `,
 
-  /**
-   * Find expired active links for the cleanup worker.
-   */
   findExpiredLinks: `
     SELECT id, short_code
     FROM urls
@@ -108,9 +99,6 @@ export const queries = {
     LIMIT $1
   `,
 
-  /**
-   * Batch-disable expired links.
-   */
   expireLinks: `
     UPDATE urls
     SET status = 'expired',
@@ -119,48 +107,13 @@ export const queries = {
     RETURNING short_code
   `,
 
-  /**
-   * List recent URLs with total click counts.
-   */
-  listUrls: `
-    SELECT 
-      u.id, 
-      u.short_code, 
-      u.original_url, 
-      u.status, 
-      u.created_at, 
-      u.updated_at, 
-      u.expires_at,
-      COALESCE(SUM(ca.click_count), 0)::BIGINT AS click_count
-    FROM urls u
-    LEFT JOIN click_analytics ca ON u.short_code = ca.short_code
-    GROUP BY u.id
-    ORDER BY u.created_at DESC
-    LIMIT $1
-  `,
-
-  /**
-   * Find a single URL with total click count.
-   */
   findUrlWithAnalytics: `
-    SELECT 
-      u.id, 
-      u.short_code, 
-      u.original_url, 
-      u.status, 
-      u.created_at, 
-      u.updated_at, 
-      u.expires_at,
-      COALESCE(SUM(ca.click_count), 0)::BIGINT AS click_count
-    FROM urls u
-    LEFT JOIN click_analytics ca ON u.short_code = ca.short_code
-    WHERE u.short_code = $1
-    GROUP BY u.id
+    SELECT id, short_code, original_url, status, created_at, updated_at,
+           expires_at, click_count, last_clicked_at, user_id
+    FROM urls
+    WHERE short_code = $1
   `,
 
-  /**
-   * Find daily click breakdown for a specific short code.
-   */
   findDailyClicks: `
     SELECT click_date, click_count
     FROM click_analytics
@@ -168,4 +121,110 @@ export const queries = {
     ORDER BY click_date DESC
     LIMIT 30
   `,
+
+  findClickBreakdown: `
+    SELECT dimension, value, SUM(count)::BIGINT AS count
+    FROM click_breakdown
+    WHERE short_code = $1
+    GROUP BY dimension, value
+    ORDER BY count DESC
+    LIMIT 20
+  `,
+
+  /** Pass NULL to aggregate the whole platform; a user id to scope to them. */
+  totals: `
+    SELECT
+      COUNT(*)::BIGINT AS total_links,
+      COUNT(*) FILTER (WHERE status = 'active')::BIGINT AS active_links,
+      COUNT(*) FILTER (WHERE status = 'disabled')::BIGINT AS disabled_links,
+      COUNT(*) FILTER (WHERE status = 'expired')::BIGINT AS expired_links,
+      COALESCE(SUM(click_count), 0)::BIGINT AS total_clicks,
+      COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours')::BIGINT AS links_last_24h
+    FROM urls
+    WHERE ($1::bigint IS NULL OR user_id = $1)
+  `,
+
+  clicksSeries: `
+    SELECT ca.click_date, SUM(ca.click_count)::BIGINT AS clicks
+    FROM click_analytics ca
+    JOIN urls u ON u.short_code = ca.short_code
+    WHERE ca.click_date >= CURRENT_DATE - INTERVAL '13 days'
+      AND ($1::bigint IS NULL OR u.user_id = $1)
+    GROUP BY ca.click_date
+    ORDER BY ca.click_date ASC
+  `,
+
+  topLinks: `
+    SELECT short_code, original_url, click_count
+    FROM urls
+    WHERE ($1::bigint IS NULL OR user_id = $1)
+    ORDER BY click_count DESC, created_at DESC
+    LIMIT 5
+  `,
+
+  /** Batched click aggregation from the worker. */
+  upsertClickAnalyticsBatch: `
+    INSERT INTO click_analytics (short_code, click_date, click_count)
+    SELECT * FROM unnest($1::text[], $2::date[], $3::bigint[])
+    ON CONFLICT (short_code, click_date)
+    DO UPDATE SET click_count = click_analytics.click_count + EXCLUDED.click_count
+  `,
+
+  upsertClickBreakdownBatch: `
+    INSERT INTO click_breakdown (short_code, click_date, dimension, value, count)
+    SELECT * FROM unnest($1::text[], $2::date[], $3::text[], $4::text[], $5::bigint[])
+    ON CONFLICT (short_code, click_date, dimension, value)
+    DO UPDATE SET count = click_breakdown.count + EXCLUDED.count
+  `,
+
+  incrementUrlClickCounts: `
+    UPDATE urls u
+    SET click_count = u.click_count + v.cnt,
+        last_clicked_at = NOW()
+    FROM (SELECT unnest($1::text[]) AS short_code, unnest($2::bigint[]) AS cnt) AS v
+    WHERE u.short_code = v.short_code
+  `,
 };
+
+/**
+ * Build a filtered, paginated list query with a windowed total count so the
+ * dashboard needs a single round trip.
+ */
+export function buildListUrlsQuery({ search, status, userId }) {
+  const conditions = [];
+  const params = [];
+
+  if (userId) {
+    params.push(userId);
+    conditions.push(`u.user_id = $${params.length}`);
+  }
+
+  if (status) {
+    params.push(status);
+    conditions.push(`u.status = $${params.length}`);
+  }
+
+  if (search) {
+    params.push(`%${search}%`);
+    conditions.push(`(u.short_code ILIKE $${params.length} OR u.original_url ILIKE $${params.length})`);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  params.push(100); // placeholder, replaced by caller-safe limit below
+  const limitIndex = params.length;
+  params.push(0);
+  const offsetIndex = params.length;
+
+  const text = `
+    SELECT u.id, u.short_code, u.original_url, u.status, u.created_at,
+           u.updated_at, u.expires_at, u.click_count, u.last_clicked_at,
+           COUNT(*) OVER()::BIGINT AS total_count
+    FROM urls u
+    ${where}
+    ORDER BY u.created_at DESC
+    LIMIT $${limitIndex} OFFSET $${offsetIndex}
+  `;
+
+  return { text, params, limitIndex, offsetIndex };
+}

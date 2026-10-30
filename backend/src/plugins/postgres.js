@@ -3,16 +3,10 @@ import pg from 'pg';
 import config from '../config.js';
 
 /**
- * PostgreSQL connection pool plugin.
+ * PostgreSQL connection pool with bounded query timeouts.
  *
- * Per document §5.2:
- *  - "Use a properly sized connection pool and reuse connections
- *     instead of opening a new connection per request."
- *  - Pool sizing should be tuned based on instance count and load testing.
- *
- * Per document §9.3:
- *  - "Reuse pooled connections; never create a new database connection per redirect."
- *  - "Watch query rate, query latency, pool wait time, pool saturation."
+ * `statement_timeout` guarantees a runaway query cannot pin a connection,
+ * and `query_timeout` rejects on the client side if the server never responds.
  */
 async function postgresPlugin(fastify) {
   const pool = new pg.Pool({
@@ -25,23 +19,31 @@ async function postgresPlugin(fastify) {
     max: config.pg.max,
     idleTimeoutMillis: config.pg.idleTimeoutMillis,
     connectionTimeoutMillis: config.pg.connectionTimeoutMillis,
+    query_timeout: config.pg.queryTimeoutMs,
+    statement_timeout: config.pg.statementTimeoutMs,
+    application_name: 'url-shortener-api',
+    options: `-c idle_in_transaction_session_timeout=${config.pg.statementTimeoutMs * 2}`,
   });
 
-  // Monitor pool errors — do not let unhandled pool errors crash the process
   pool.on('error', (err) => {
-    fastify.log.error({ err }, 'PostgreSQL pool background error');
+    fastify.log.error({ err: err.message }, 'PostgreSQL pool background error');
   });
 
-  // Decorate fastify with the pool for use in routes/services
   fastify.decorate('pg', pool);
 
-  // Graceful shutdown: drain pool connections
+  fastify.addHook('onReady', async () => {
+    try {
+      await pool.query('SELECT 1');
+      fastify.log.info({ max: config.pg.max }, 'PostgreSQL pool ready');
+    } catch (err) {
+      fastify.log.error({ err: err.message }, 'PostgreSQL not reachable at startup');
+    }
+  });
+
   fastify.addHook('onClose', async () => {
     fastify.log.info('Closing PostgreSQL connection pool');
-    await pool.end();
+    await pool.end().catch(() => {});
   });
 }
 
-export default fp(postgresPlugin, {
-  name: 'postgres',
-});
+export default fp(postgresPlugin, { name: 'postgres' });

@@ -1,0 +1,8 @@
+node_modules
+coverage
+.env*
+!.env.example
+!.env.production.example
+tests
+*.log
+Dockerfile*

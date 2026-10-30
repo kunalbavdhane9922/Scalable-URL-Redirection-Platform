@@ -1,5 +1,12 @@
 import { describe, it, expect } from '@jest/globals';
-import { isValidCodeFormat, validateUrl, isActiveAndUnexpired } from '../../src/utils/validation.js';
+import {
+  isValidCodeFormat,
+  validateAlias,
+  validateUrl,
+  isActiveAndUnexpired,
+  deviceFromUserAgent,
+  referrerHost,
+} from '../../src/utils/validation.js';
 import { ValidationError } from '../../src/utils/errors.js';
 
 describe('Validation Utilities (§13 Security & Input Safety)', () => {
@@ -8,6 +15,7 @@ describe('Validation Utilities (§13 Security & Input Safety)', () => {
       expect(isValidCodeFormat('abc123X')).toBe(true);
       expect(isValidCodeFormat('a')).toBe(true);
       expect(isValidCodeFormat('ABCDEFG1234567890xyz')).toBe(true);
+      expect(isValidCodeFormat('a'.repeat(32))).toBe(true); // alias max
     });
 
     it('rejects invalid or dangerous characters', () => {
@@ -25,7 +33,37 @@ describe('Validation Utilities (§13 Security & Input Safety)', () => {
       expect(isValidCodeFormat(null)).toBe(false);
       expect(isValidCodeFormat(undefined)).toBe(false);
       expect(isValidCodeFormat(12345)).toBe(false);
-      expect(isValidCodeFormat('a'.repeat(21))).toBe(false); // max is 20
+      expect(isValidCodeFormat('a'.repeat(33))).toBe(false); // max is 32
+    });
+  });
+
+  describe('validateAlias (custom alias safety)', () => {
+    it('accepts normal aliases', () => {
+      expect(validateAlias('summer-sale_2026')).toBe('summer-sale_2026');
+      expect(validateAlias('  spaced  ')).toBe('spaced');
+    });
+
+    it('rejects aliases that are too short or too long', () => {
+      expect(() => validateAlias('ab')).toThrow(ValidationError);
+      expect(() => validateAlias('a'.repeat(33))).toThrow(ValidationError);
+    });
+
+    it('rejects reserved aliases so routes cannot be shadowed', () => {
+      expect(() => validateAlias('api')).toThrow(ValidationError);
+      expect(() => validateAlias('HEALTH')).toThrow(ValidationError);
+      expect(() => validateAlias('metrics')).toThrow(ValidationError);
+      expect(() => validateAlias('dashboard')).toThrow(ValidationError);
+      expect(() => validateAlias('register')).toThrow(ValidationError);
+      expect(() => validateAlias('forgot-password')).toThrow(ValidationError);
+      expect(() => validateAlias('reset-password')).toThrow(ValidationError);
+      expect(() => validateAlias('verify-email')).toThrow(ValidationError);
+    });
+
+    it('rejects unsafe characters and non-strings', () => {
+      expect(() => validateAlias('bad alias')).toThrow(ValidationError);
+      expect(() => validateAlias('bad/alias')).toThrow(ValidationError);
+      expect(() => validateAlias('../../etc')).toThrow(ValidationError);
+      expect(() => validateAlias(42)).toThrow(ValidationError);
     });
   });
 
@@ -85,6 +123,22 @@ describe('Validation Utilities (§13 Security & Input Safety)', () => {
       const pastDate = new Date(Date.now() - 10000).toISOString();
       const link = { status: 'active', expires_at: pastDate };
       expect(isActiveAndUnexpired(link)).toBe(false);
+    });
+  });
+
+  describe('Analytics helpers', () => {
+    it('derives coarse device labels from user agents', () => {
+      expect(deviceFromUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Mobile')).toBe('mobile');
+      expect(deviceFromUserAgent('Mozilla/5.0 (iPad; CPU OS 17_0) Tablet')).toBe('tablet');
+      expect(deviceFromUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)')).toBe('desktop');
+      expect(deviceFromUserAgent('Googlebot/2.1')).toBe('bot');
+      expect(deviceFromUserAgent('')).toBe('unknown');
+    });
+
+    it('extracts referrer host without storing the full URL', () => {
+      expect(referrerHost('https://news.ycombinator.com/item?id=1')).toBe('news.ycombinator.com');
+      expect(referrerHost('')).toBe('direct');
+      expect(referrerHost('not a url')).toBe('direct');
     });
   });
 });

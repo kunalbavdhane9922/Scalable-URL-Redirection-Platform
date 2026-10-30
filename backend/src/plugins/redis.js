@@ -3,42 +3,31 @@ import Redis from 'ioredis';
 import config from '../config.js';
 
 /**
- * Redis plugin — provides both a command client and a dedicated
- * subscriber connection for Pub/Sub cache invalidation.
+ * Redis command client + dedicated Pub/Sub subscriber.
  *
- * Per document §9.1:
- *  - "L2 is shared Redis."
- *  - "Pub/Sub messages are not durable" — bounded TTLs are the fallback.
- *
- * Per document §12 (Table 8):
- *  - "Redis unavailable → Fall back to PostgreSQL where safe; use circuit
- *     breaking, timeouts, and controlled concurrency to protect the database."
+ * Auto-pipelining batches concurrent cache reads/writes into fewer round
+ * trips under load. The subscriber connection cannot pipeline.
  */
 async function redisPlugin(fastify) {
-  const redisOptions = {
+  const baseOptions = {
     host: config.redis.host,
     port: config.redis.port,
     password: config.redis.password || undefined,
     db: config.redis.db,
     connectTimeout: config.redis.connectTimeout,
     commandTimeout: config.redis.commandTimeout,
-    maxRetriesPerRequest: 3,
+    maxRetriesPerRequest: 2,
+    keepAlive: 10000,
+    noDelay: true,
     retryStrategy(times) {
-      // Exponential backoff, cap at 3 seconds
-      const delay = Math.min(times * 200, 3000);
-      return delay;
+      return Math.min(times * 200, 3000);
     },
     lazyConnect: true,
     enableReadyCheck: true,
   };
 
-  // Primary command client
-  const redis = new Redis(redisOptions);
-
-  // Dedicated subscriber for Pub/Sub invalidation (§10 step 3)
-  // A separate connection is required because a subscribed connection
-  // cannot issue regular commands.
-  const redisSub = new Redis(redisOptions);
+  const redis = new Redis({ ...baseOptions, enableAutoPipelining: true });
+  const redisSub = new Redis(baseOptions);
 
   let redisAvailable = false;
 
@@ -56,6 +45,10 @@ async function redisPlugin(fastify) {
     redisAvailable = false;
   });
 
+  redis.on('reconnecting', () => {
+    fastify.log.warn('Redis command client reconnecting');
+  });
+
   redisSub.on('ready', () => {
     fastify.log.info('Redis subscriber client connected');
   });
@@ -64,7 +57,6 @@ async function redisPlugin(fastify) {
     fastify.log.error({ err: err.message }, 'Redis subscriber client error');
   });
 
-  // Connect both clients
   try {
     await redis.connect();
   } catch (err) {
@@ -77,7 +69,6 @@ async function redisPlugin(fastify) {
     fastify.log.warn({ err: err.message }, 'Redis subscriber client failed to connect on startup — will retry');
   }
 
-  // Expose availability check for fallback logic
   fastify.decorate('redis', redis);
   fastify.decorate('redisSub', redisSub);
   fastify.decorate('isRedisAvailable', () => redisAvailable);
@@ -89,6 +80,4 @@ async function redisPlugin(fastify) {
   });
 }
 
-export default fp(redisPlugin, {
-  name: 'redis',
-});
+export default fp(redisPlugin, { name: 'redis' });

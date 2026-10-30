@@ -1,21 +1,11 @@
 import config from '../config.js';
 import { createShortUrl } from '../services/url-service.js';
-import { ValidationError } from '../utils/errors.js';
 
 /**
- * POST /api/shorten — URL Creation Flow
+ * POST /api/shorten — create a short link.
  *
- * Per document §7 and Appendix A:
- *  - "Validate and persist a long URL, create a short code."
- *  - "201 Created (or 200 by API convention) with short URL and optional metadata."
- *
- * Per document §6.1:
- *  - "Rate-limit URL creation"
- *
- * Per document §13:
- *  - "Avoid exposing internal database errors or stack traces to clients."
- *  - "Do not fetch user-submitted URLs from the server as part of ordinary
- *     shortening; doing so can introduce SSRF risk."
+ * Public endpoint, rate limited per IP. An optional customAlias lets the
+ * caller choose the code; collisions return 409 instead of silently retrying.
  */
 export default async function shortenRoutes(fastify) {
   fastify.post('/api/shorten', {
@@ -32,6 +22,7 @@ export default async function shortenRoutes(fastify) {
         properties: {
           url: { type: 'string' },
           expiresAt: { type: 'string', format: 'date-time', nullable: true },
+          customAlias: { type: 'string', minLength: 3, maxLength: 32, nullable: true },
         },
         additionalProperties: false,
       },
@@ -39,18 +30,23 @@ export default async function shortenRoutes(fastify) {
         201: {
           type: 'object',
           properties: {
+            id: { type: ['integer', 'string'] },
             shortCode: { type: 'string' },
             shortUrl: { type: 'string' },
             originalUrl: { type: 'string' },
             status: { type: 'string' },
             createdAt: { type: 'string' },
             expiresAt: { type: 'string', nullable: true },
+            owned: { type: 'boolean' },
           },
         },
       },
     },
   }, async (request, reply) => {
-    const { url, expiresAt } = request.body;
+    const { url, expiresAt, customAlias } = request.body;
+
+    // Signed-in users own their links; anonymous links stay unowned.
+    const user = await fastify.getOptionalUser(request);
 
     const result = await createShortUrl(
       fastify.pg,
@@ -58,9 +54,13 @@ export default async function shortenRoutes(fastify) {
       fastify.isRedisAvailable,
       fastify.log,
       url,
-      { expiresAt: expiresAt || null },
+      {
+        expiresAt: expiresAt || null,
+        customAlias: customAlias || null,
+        ownerId: user?.id || null,
+      },
     );
 
-    return reply.code(201).send(result);
+    return reply.code(201).send({ ...result, owned: Boolean(user) });
   });
 }

@@ -1,45 +1,121 @@
-/**
- * Analytics event handler.
- *
- * Per document Table 7:
- *  - Workload: Click analytics
- *  - Event: link_clicked
- *  - Action: "Aggregate click counts and metadata into analytics storage."
- *
- * Per document §11.1:
- *  - "Make workers idempotent because at-least-once delivery can produce
- *     duplicate events."
- *  - "For click analytics, decide whether best-effort loss is acceptable."
- *
- * This handler aggregates click events. The current implementation uses
- * PostgreSQL for analytics storage; a dedicated analytics store (e.g.,
- * ClickHouse, TimescaleDB) can replace it when scale demands.
- */
+import { queries } from '../db/queries.js';
 
 /**
- * Handle a click analytics event.
- * Idempotent: processing the same event multiple times produces the same
- * aggregate result (increment is safe for counters with at-least-once semantics).
+ * Click analytics aggregation.
  *
- * @param {import('pg').Pool} pgPool
- * @param {import('pino').Logger} logger
- * @param {object} payload - Event payload
+ * Events are grouped in memory per (short_code, day) and written with three
+ * set-based statements per batch. That turns N click events into 3 queries
+ * instead of N, which is what keeps the worker viable at high redirect volume.
  */
-export async function handleClickEvent(pgPool, logger, payload) {
-  const { shortCode, clickedAt } = payload;
+
+function dayOf(clickedAt) {
+  const date = clickedAt ? new Date(clickedAt) : new Date();
+  if (Number.isNaN(date.getTime())) return new Date().toISOString().slice(0, 10);
+  return date.toISOString().slice(0, 10);
+}
+
+function buildAggregates(events) {
+  const totals = new Map(); // `${code}|${day}` -> [code, day, count]
+  const breakdown = new Map(); // `${code}|${day}|dim|value` -> row
+  const perUrl = new Map();
+
+  for (const event of events) {
+    const shortCode = event.shortCode;
+    if (!shortCode) continue;
+
+    const day = dayOf(event.clickedAt);
+    const totalKey = `${shortCode}|${day}`;
+    const total = totals.get(totalKey);
+    if (total) total[2] += 1;
+    else totals.set(totalKey, [shortCode, day, 1]);
+
+    const dimensions = [
+      ['referrer', event.referrer || 'direct'],
+      ['device', event.device || 'unknown'],
+    ];
+    if (event.country) dimensions.push(['country', event.country]);
+
+    for (const [dimension, value] of dimensions) {
+      const key = `${shortCode}|${day}|${dimension}|${value}`;
+      const row = breakdown.get(key);
+      if (row) row[4] += 1;
+      else breakdown.set(key, [shortCode, day, dimension, String(value).slice(0, 120), 1]);
+    }
+
+    perUrl.set(shortCode, (perUrl.get(shortCode) || 0) + 1);
+  }
+
+  return {
+    totals: [...totals.values()],
+    breakdown: [...breakdown.values()],
+    perUrl: [...perUrl.entries()],
+  };
+}
+
+async function runBatch(pgPool, statements) {
+  const client = typeof pgPool.connect === 'function' ? await pgPool.connect() : pgPool;
+  const ownClient = client !== pgPool;
 
   try {
-    // Upsert click count — idempotent aggregate operation
-    await pgPool.query(`
-      INSERT INTO click_analytics (short_code, click_date, click_count)
-      VALUES ($1, $2::timestamptz::date, 1)
-      ON CONFLICT (short_code, click_date)
-      DO UPDATE SET click_count = click_analytics.click_count + 1
-    `, [shortCode, clickedAt]);
-
-    logger.debug({ shortCode }, 'Click event processed');
+    if (ownClient) await client.query('BEGIN');
+    for (const [sql, params] of statements) {
+      await client.query(sql, params);
+    }
+    if (ownClient) await client.query('COMMIT');
   } catch (err) {
-    logger.error({ err: err.message, shortCode }, 'Failed to process click event');
-    throw err; // Let the worker retry
+    if (ownClient) await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    if (ownClient && client.release) client.release();
   }
+}
+
+/**
+ * Process a batch of click events atomically.
+ */
+export async function handleClickBatch(pgPool, logger, events) {
+  if (!events || events.length === 0) return;
+
+  const { totals, breakdown, perUrl } = buildAggregates(events);
+  if (totals.length === 0) return;
+
+  const statements = [
+    [
+      queries.upsertClickAnalyticsBatch,
+      [
+        totals.map((r) => r[0]),
+        totals.map((r) => r[1]),
+        totals.map((r) => r[2]),
+      ],
+    ],
+  ];
+
+  // PostgreSQL cannot infer the type of an all-NULL unnest array.
+  if (breakdown.length > 0) {
+    statements.push([
+      queries.upsertClickBreakdownBatch,
+      [
+        breakdown.map((r) => r[0]),
+        breakdown.map((r) => r[1]),
+        breakdown.map((r) => r[2]),
+        breakdown.map((r) => r[3]),
+        breakdown.map((r) => r[4]),
+      ],
+    ]);
+  }
+
+  statements.push([
+    queries.incrementUrlClickCounts,
+    [perUrl.map((r) => r[0]), perUrl.map((r) => r[1])],
+  ]);
+
+  await runBatch(pgPool, statements);
+  logger?.debug({ events: events.length, groups: totals.length }, 'Click batch aggregated');
+}
+
+/**
+ * Backwards-compatible single-event entry point.
+ */
+export async function handleClickEvent(pgPool, logger, payload) {
+  return handleClickBatch(pgPool, logger, [payload]);
 }

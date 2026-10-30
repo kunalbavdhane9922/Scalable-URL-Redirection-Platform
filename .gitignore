@@ -13,6 +13,9 @@ build/
 .env.local
 .env.*.local
 *.env
+.env.*
+!.env.example
+!.env.production.example
 
 # Logs and debug
 npm-debug.log*
@@ -40,3 +43,14 @@ desktop.ini
 # Temporary data / Docker volumes
 pgdata/
 redisdata/
+
+# Production env files
+.env.production
+.env.production.*
+!.env.production.example
+
+# Local validation evidence
+validation/
+
+# Backups
+backups/

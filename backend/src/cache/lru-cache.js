@@ -38,6 +38,15 @@ const negativeCache = new LRUCache({
   updateAgeOnHas: false,
 });
 
+// Gone cache: maps short_code → 'disabled' | 'expired' (known-unavailable)
+// Kept separate from "not found" so repeated hits return the correct 410.
+const goneCache = new LRUCache({
+  max: config.l1Cache.negativeMaxEntries,
+  ttl: config.l1Cache.negativeTtlMs,
+  updateAgeOnGet: false,
+  updateAgeOnHas: false,
+});
+
 /**
  * Get a destination URL from L1 cache.
  * Returns the original_url string on hit, or undefined on miss.
@@ -73,12 +82,29 @@ export function l1SetNegative(code) {
 }
 
 /**
+ * Mark a code as gone (disabled or expired).
+ * @param {string} code
+ * @param {'disabled'|'expired'} reason
+ */
+export function l1SetGone(code, reason = 'disabled') {
+  goneCache.set(code, reason);
+}
+
+/**
+ * Check if a code is cached as gone. Returns the reason or undefined.
+ */
+export function l1GetGone(code) {
+  return goneCache.get(code);
+}
+
+/**
  * Evict a specific code from both caches.
  * Used during cache invalidation (document §10 step 3).
  */
 export function l1Evict(code) {
   positiveCache.delete(code);
   negativeCache.delete(code);
+  goneCache.delete(code);
 }
 
 /**
@@ -87,6 +113,7 @@ export function l1Evict(code) {
 export function l1Clear() {
   positiveCache.clear();
   negativeCache.clear();
+  goneCache.clear();
 }
 
 /**
@@ -101,6 +128,10 @@ export function l1Stats() {
     negative: {
       size: negativeCache.size,
       max: negativeCache.max,
+    },
+    gone: {
+      size: goneCache.size,
+      max: goneCache.max,
     },
   };
 }

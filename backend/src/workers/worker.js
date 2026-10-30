@@ -1,37 +1,32 @@
 import 'dotenv/config';
+import { createServer } from 'node:http';
 import pg from 'pg';
 import Redis from 'ioredis';
 import pino from 'pino';
 import config from '../config.js';
 import { queries } from '../db/queries.js';
-import { ensureConsumerGroup, readEvents, acknowledgeEvent } from '../services/queue-service.js';
-import { handleClickEvent } from './analytics-handler.js';
+import {
+  ensureConsumerGroup,
+  readEvents,
+  acknowledgeEvent,
+  claimStaleEvents,
+  deadLetterEvent,
+} from '../services/queue-service.js';
+import { handleClickBatch } from './analytics-handler.js';
 import { handleLifecycleEvent } from './lifecycle-handler.js';
 import { cleanupExpiredLinks } from './cleanup-handler.js';
-import { invalidateL2 } from '../services/cache-service.js';
+import { purgeExpiredAuth } from '../services/auth-service.js';
 
 /**
- * Background worker process.
- *
- * Per document §11 (Table 7):
- *  - Consumes events from Redis Streams.
- *  - Routes events to appropriate handlers.
- *  - Handles click analytics, lifecycle events, cleanup, etc.
- *
- * Per document §11.1:
- *  - "Use acknowledgements/consumer offsets, retry with exponential backoff,
- *     and dead-letter handling where supported."
- *  - "Make workers idempotent because at-least-once delivery can produce
- *     duplicate events."
- *
- * Per document Table 8:
- *  - "Worker failure → Retry transient errors with backoff, use idempotent
- *     handlers, and route poison messages to a dead-letter mechanism."
+ * Background worker: outbox relay, click analytics, lifecycle events, and
+ * expiry cleanup. Designed for at-least-once delivery with idempotent,
+ * batched handlers and a dead-letter stream for poison messages.
  */
 
-const logger = pino({ level: config.logLevel });
-
-// ─── Infrastructure connections ──────────────────────────────────────
+const logger = pino({
+  level: config.logLevel,
+  base: { service: 'url-shortener-worker', pid: process.pid },
+});
 
 const pgPool = new pg.Pool({
   host: config.pg.host,
@@ -40,9 +35,12 @@ const pgPool = new pg.Pool({
   password: config.pg.password,
   database: config.pg.database,
   min: 1,
-  max: 5, // Workers need fewer connections than app servers
+  max: 5,
   idleTimeoutMillis: config.pg.idleTimeoutMillis,
   connectionTimeoutMillis: config.pg.connectionTimeoutMillis,
+  query_timeout: config.pg.queryTimeoutMs,
+  statement_timeout: config.pg.statementTimeoutMs,
+  application_name: 'url-shortener-worker',
 });
 
 const redis = new Redis({
@@ -58,6 +56,18 @@ const redis = new Redis({
   },
 });
 
+/**
+ * XREADGROUP BLOCK parks the connection until a message arrives, which would
+ * starve the ack/publish commands on the shared client and be killed by its
+ * short commandTimeout. Blocking reads therefore get their own connection with
+ * a timeout comfortably above the block window.
+ */
+const redisBlocking = redis.duplicate({
+  commandTimeout: config.queue.blockMs + 5000,
+  maxRetriesPerRequest: null,
+});
+redisBlocking.on('error', () => {});
+
 let redisAvailable = false;
 redis.on('ready', () => { redisAvailable = true; });
 redis.on('error', () => { redisAvailable = false; });
@@ -65,11 +75,9 @@ redis.on('close', () => { redisAvailable = false; });
 
 const isRedisAvailable = () => redisAvailable;
 
-// ─── Event routing ───────────────────────────────────────────────────
+/** messageId → handler failures (reset when acked or dead-lettered). */
+const attempts = new Map();
 
-/**
- * Parse raw stream message fields into a structured event.
- */
 function parseStreamMessage(fields) {
   const obj = {};
   for (let i = 0; i < fields.length; i += 2) {
@@ -82,38 +90,64 @@ function parseStreamMessage(fields) {
   };
 }
 
-/**
- * Route an event to its handler.
- * Per document Table 7: event types map to specific worker actions.
- */
-async function handleEvent(eventType, payload) {
-  switch (eventType) {
-    case 'link_clicked':
-      await handleClickEvent(pgPool, logger, payload);
-      break;
+async function failOrDeadLetter(messageId, fields, eventType, err) {
+  const count = (attempts.get(messageId) || 0) + 1;
+  attempts.set(messageId, count);
 
-    case 'link_created':
-    case 'link_updated':
-    case 'link_disabled':
-      await handleLifecycleEvent(pgPool, logger, eventType, payload);
-      break;
+  logger.warn({ messageId, eventType, attempt: count, err: err.message }, 'Event handler failed');
 
-    default:
-      logger.warn({ eventType }, 'Unknown event type, skipping');
+  if (count >= config.queue.maxRetries) {
+    await deadLetterEvent(redis, logger, messageId, fields, err.message);
+    attempts.delete(messageId);
+  }
+  // Otherwise leave it pending; XAUTOCLAIM re-delivers it after the idle window.
+}
+
+async function processMessages(messages) {
+  const clicks = [];
+  const others = [];
+
+  for (const [messageId, fields] of messages) {
+    try {
+      const parsed = parseStreamMessage(fields);
+      if (parsed.eventType === 'link_clicked') {
+        clicks.push({ messageId, fields, payload: parsed.payload });
+      } else {
+        others.push({ messageId, fields, ...parsed });
+      }
+    } catch (err) {
+      await deadLetterEvent(redis, logger, messageId, fields, `parse error: ${err.message}`);
+    }
+  }
+
+  if (clicks.length > 0) {
+    try {
+      await handleClickBatch(pgPool, logger, clicks.map((c) => c.payload));
+      for (const click of clicks) {
+        await acknowledgeEvent(redis, click.messageId);
+        attempts.delete(click.messageId);
+      }
+    } catch (err) {
+      for (const click of clicks) {
+        await failOrDeadLetter(click.messageId, click.fields, 'link_clicked', err);
+      }
+    }
+  }
+
+  for (const event of others) {
+    try {
+      await handleLifecycleEvent(pgPool, logger, event.eventType, event.payload);
+      await acknowledgeEvent(redis, event.messageId);
+      attempts.delete(event.messageId);
+    } catch (err) {
+      await failOrDeadLetter(event.messageId, event.fields, event.eventType, err);
+    }
   }
 }
 
-// ─── Outbox relay ────────────────────────────────────────────────────
-
-/**
- * Outbox relay: publish pending outbox events to the stream.
- * Per §7 step 8 and §11.1:
- *  - "Use a transactional outbox for critical events."
- *  - Polls the outbox table and publishes to Redis Streams.
- */
 async function processOutbox() {
   try {
-    const result = await pgPool.query(queries.fetchUnpublishedOutboxEvents, [50]);
+    const result = await pgPool.query(queries.claimOutboxEvents, [50, 60]);
 
     for (const event of result.rows) {
       try {
@@ -124,16 +158,13 @@ async function processOutbox() {
           'payload', JSON.stringify(event.payload),
           'timestamp', new Date(event.created_at).getTime().toString(),
         );
-
         await pgPool.query(queries.markOutboxPublished, [event.id]);
       } catch (err) {
         logger.error({ err: err.message, eventId: event.id }, 'Failed to publish outbox event');
+        await pgPool.query(queries.releaseOutboxClaim, [event.id]).catch(() => {});
 
-        // Increment retry count
-        await pgPool.query(queries.incrementOutboxRetry, [event.id]).catch(() => {});
-
-        // Dead-letter: if too many retries, log and skip
         if (event.retries >= config.queue.maxRetries) {
+          await pgPool.query(queries.markOutboxPublished, [event.id]).catch(() => {});
           logger.error({ eventId: event.id, eventType: event.event_type },
             'Outbox event exceeded max retries — dead-lettered');
         }
@@ -144,75 +175,116 @@ async function processOutbox() {
   }
 }
 
-// ─── Main consumer loop ──────────────────────────────────────────────
-
 let running = true;
+let processing = false;
 
 async function consumeEvents() {
   await ensureConsumerGroup(redis, logger);
-
-  logger.info('Worker started, consuming events...');
+  logger.info({ stream: config.queue.streamKey }, 'Worker consuming events');
 
   while (running) {
     try {
-      const result = await readEvents(redis);
-
-      if (!result) continue; // No messages (block timeout expired)
+      const result = await readEvents(redisBlocking);
+      lastLoopAt = Date.now();
+      if (!result) continue;
 
       for (const [, messages] of result) {
-        for (const [messageId, fields] of messages) {
-          try {
-            const { eventType, payload } = parseStreamMessage(fields);
-            await handleEvent(eventType, payload);
-            await acknowledgeEvent(redis, messageId);
-          } catch (err) {
-            // Per §11.1: "retry with exponential backoff"
-            // Failed messages remain unacknowledged and will be re-delivered.
-            logger.error({ err: err.message, messageId }, 'Failed to process event');
-          }
-        }
+        if (messages.length === 0) continue;
+        processing = true;
+        await processMessages(messages);
+        processing = false;
       }
     } catch (err) {
+      processing = false;
       if (!running) break;
+
+      if (String(err.message).includes('NOGROUP')) {
+        await ensureConsumerGroup(redis, logger).catch(() => {});
+      }
+
       logger.error({ err: err.message }, 'Consumer loop error');
-      // Backoff on consumer errors
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
   }
 }
 
-// ─── Periodic tasks ──────────────────────────────────────────────────
+async function reclaimStale() {
+  try {
+    const messages = await claimStaleEvents(redis, logger);
+    if (!messages || messages.length === 0) return;
 
-// Outbox relay runs every 5 seconds
+    processing = true;
+    await processMessages(messages);
+    processing = false;
+  } catch (err) {
+    processing = false;
+    logger.warn({ err: err.message }, 'Stale message reclaim error');
+  }
+}
+
 const outboxInterval = setInterval(processOutbox, 5000);
-
-// Expired link cleanup runs every 60 seconds
 const cleanupInterval = setInterval(() => {
-  cleanupExpiredLinks(pgPool, redis, isRedisAvailable, logger).catch(err => {
+  cleanupExpiredLinks(pgPool, redis, isRedisAvailable, logger).catch((err) => {
     logger.error({ err: err.message }, 'Cleanup task error');
   });
 }, 60000);
+const authCleanupInterval = setInterval(() => {
+  purgeExpiredAuth(pgPool).catch((err) => {
+    logger.warn({ err: err.message }, 'Auth token cleanup failed');
+  });
+}, 60 * 60 * 1000);
+const reclaimInterval = setInterval(reclaimStale, 30000);
 
-// ─── Graceful shutdown ───────────────────────────────────────────────
+// ─── Worker health endpoint ─────────────────────────────────────────
+const healthPort = parseInt(process.env.WORKER_HEALTH_PORT, 10) || 3001;
+let lastLoopAt = Date.now();
 
+const healthServer = createServer((req, res) => {
+  if (req.url === '/health' || req.url === '/health/live') {
+    const healthy = Date.now() - lastLoopAt < 30000;
+    res.writeHead(healthy ? 200 : 503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      status: healthy ? 'alive' : 'stalled',
+      redis: redisAvailable ? 'healthy' : 'unavailable',
+      lastLoopAt: new Date(lastLoopAt).toISOString(),
+    }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not Found' }));
+});
+
+// ─── Graceful shutdown ──────────────────────────────────────────────
 async function shutdown(signal) {
   logger.info({ signal }, 'Worker shutting down');
   running = false;
 
   clearInterval(outboxInterval);
   clearInterval(cleanupInterval);
+  clearInterval(authCleanupInterval);
+  clearInterval(reclaimInterval);
+
+  healthServer.close();
+
+  const deadline = Date.now() + 8000;
+  while (processing && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 
   await redis.quit().catch(() => {});
+  redisBlocking.disconnect();
   await pgPool.end().catch(() => {});
-
   process.exit(0);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-// Start consuming
-consumeEvents().catch(err => {
+healthServer.listen(healthPort, '0.0.0.0', () => {
+  logger.info({ port: healthPort }, 'Worker health endpoint listening');
+});
+
+consumeEvents().catch((err) => {
   logger.fatal({ err: err.message }, 'Worker crashed');
   process.exit(1);
 });

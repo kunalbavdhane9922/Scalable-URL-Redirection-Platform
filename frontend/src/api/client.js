@@ -1,84 +1,193 @@
 /**
- * API client for interacting with the URL shortener backend service.
+ * API client for the URL redirection platform.
+ *
+ * Authentication is an HttpOnly session cookie; every request uses
+ * `credentials: 'include'` so the same build works against a same-origin edge
+ * or a cross-origin API during development.
  */
 
-const BASE_API = '/api';
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
+const SESSION_EVENT = 'shortly:session';
 
-export async function shortenUrl(url, expiresAt = null) {
-  const response = await fetch(`${BASE_API}/shorten`, {
+export class ApiError extends Error {
+  constructor(message, { status, code, requestId } = {}) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status ?? 0;
+    this.code = code ?? 'REQUEST_FAILED';
+    this.requestId = requestId;
+  }
+}
+
+export function emitSessionChange(user) {
+  window.dispatchEvent(new CustomEvent(SESSION_EVENT, { detail: user }));
+}
+
+export function subscribeSession(listener) {
+  const handler = (event) => listener(event.detail ?? null);
+  window.addEventListener(SESSION_EVENT, handler);
+  return () => window.removeEventListener(SESSION_EVENT, handler);
+}
+
+/* ── Core request helper ─────────────────────────────────────────── */
+
+async function request(path, { method = 'GET', body, signal, headers = {} } = {}) {
+  const finalHeaders = { Accept: 'application/json', ...headers };
+  if (body !== undefined) finalHeaders['Content-Type'] = 'application/json';
+
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers: finalHeaders,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      credentials: 'include',
+      signal,
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') throw err;
+    throw new ApiError('Cannot reach the API. Check your connection or API base URL.', {
+      code: 'NETWORK_ERROR',
+    });
+  }
+
+  if (response.status === 204) return null;
+
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { message: text };
+    }
+  }
+
+  if (!response.ok) {
+    const message =
+      data?.message ||
+      (response.status === 401
+        ? 'Sign in to continue'
+        : response.status === 403
+          ? 'You do not have access to this resource'
+          : `Request failed (${response.status})`);
+    throw new ApiError(message, {
+      status: response.status,
+      code: data?.error || `HTTP_${response.status}`,
+      requestId: data?.requestId,
+    });
+  }
+
+  return data;
+}
+
+/* ── Links ───────────────────────────────────────────────────────── */
+
+export function shortenUrl({ url, customAlias, expiresAt }, options = {}) {
+  return request('/api/shorten', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+    body: {
       url,
-      expiresAt: expiresAt || null,
-    }),
+      ...(customAlias ? { customAlias } : {}),
+      ...(expiresAt ? { expiresAt } : {}),
+    },
+    ...options,
   });
-
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.message || data.error || 'Failed to shorten URL');
-  }
-  return data;
 }
 
-export async function fetchLinks(limit = 50) {
-  const response = await fetch(`${BASE_API}/links?limit=${limit}`);
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.message || 'Failed to fetch links');
-  }
-  return data;
+export function fetchLinks({ page = 1, limit = 20, q = '', status = '' } = {}, options = {}) {
+  const params = new URLSearchParams({ page: String(page), limit: String(limit) });
+  if (q) params.set('q', q);
+  if (status) params.set('status', status);
+  return request(`/api/links?${params}`, options);
 }
 
-export async function fetchLinkDetails(code) {
-  const response = await fetch(`${BASE_API}/links/${encodeURIComponent(code)}`);
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.message || 'Failed to fetch link details');
-  }
-  return data;
-}
+export const fetchLinkDetails = (code, options) =>
+  request(`/api/links/${encodeURIComponent(code)}`, options);
 
-export async function updateLink(code, url) {
-  const response = await fetch(`${BASE_API}/links/${encodeURIComponent(code)}`, {
+export function updateLink(code, changes, options = {}) {
+  const body = {};
+  if (Object.prototype.hasOwnProperty.call(changes, 'url')) body.url = changes.url;
+  if (Object.prototype.hasOwnProperty.call(changes, 'expiresAt')) body.expiresAt = changes.expiresAt;
+  return request(`/api/links/${encodeURIComponent(code)}`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url }),
+    body,
+    ...options,
   });
+}
 
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.message || 'Failed to update link');
-  }
+export const disableLink = (code, options) =>
+  request(`/api/links/${encodeURIComponent(code)}`, { method: 'DELETE', ...options });
+
+export const fetchPlatformStats = (options) => request('/api/stats', options);
+export const fetchPublicStats = (options) => request('/api/public/stats', options);
+
+/* ── Authentication ──────────────────────────────────────────────── */
+
+const oauthBase = `${API_BASE}/api/auth`;
+
+export const fetchProviders = (options) => request('/api/auth/providers', options);
+
+export async function fetchMe(options) {
+  const data = await request('/api/auth/me', options);
+  return data?.user || null;
+}
+
+export async function registerAccount({ email, password, name }, options) {
+  const data = await request('/api/auth/register', {
+    method: 'POST',
+    body: { email, password, ...(name ? { name } : {}) },
+    ...options,
+  });
+  // Unverified registrations get no session, so do not flip the local UI state.
+  if (!data.requiresVerification) emitSessionChange(data.user);
   return data;
 }
 
-export async function disableLink(code) {
-  const response = await fetch(`${BASE_API}/links/${encodeURIComponent(code)}`, {
-    method: 'DELETE',
+export async function loginAccount({ email, password }, options) {
+  const data = await request('/api/auth/login', {
+    method: 'POST',
+    body: { email, password },
+    ...options,
   });
-
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.message || 'Failed to disable link');
-  }
-  return true;
+  emitSessionChange(data.user);
+  return data;
 }
 
-export async function fetchHealth() {
-  const response = await fetch('/health');
-  const data = await response.json();
-  return {
-    ok: response.ok,
-    status: response.status,
-    data,
-  };
+export async function logoutAccount(options) {
+  await request('/api/auth/logout', { method: 'POST', ...options });
+  emitSessionChange(null);
 }
 
-export async function fetchMetrics() {
-  const response = await fetch('/health/metrics');
-  if (!response.ok) {
-    throw new Error('Metrics endpoint not accessible');
-  }
-  return response.json();
+export const requestPasswordReset = (email, options) =>
+  request('/api/auth/forgot-password', { method: 'POST', body: { email }, ...options });
+
+export async function resetPassword({ token, password }, options) {
+  const data = await request('/api/auth/reset-password', {
+    method: 'POST',
+    body: { token, password },
+    ...options,
+  });
+  emitSessionChange(null);
+  return data;
+}
+
+export async function verifyEmailToken(token, options) {
+  const data = await request('/api/auth/verify-email', {
+    method: 'POST',
+    body: { token },
+    ...options,
+  });
+  return data?.user || null;
+}
+
+export const resendVerification = (options) =>
+  request('/api/auth/resend-verification', { method: 'POST', ...options });
+
+export function oauthSignInUrl(provider) {
+  return `${oauthBase}/oauth/${encodeURIComponent(provider)}`;
+}
+
+export function devSignInUrl(email = 'dev@shortly.local') {
+  return `${oauthBase}/dev-login?email=${encodeURIComponent(email)}`;
 }
